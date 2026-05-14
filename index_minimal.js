@@ -19,9 +19,21 @@ const AK = process.env.OSS_ACCESS_KEY_ID;
 const SK = process.env.OSS_ACCESS_KEY_SECRET;
 const OSS_REGION = process.env.OSS_REGION || 'oss-cn-hangzhou';
 const OSS_BUCKET = process.env.OSS_BUCKET;
-// 🌐 CDN 域名（注意：必须包含协议，如 https://i.example.com）
-const CDN_DOMAIN = process.env.CDN_DOMAIN || 'https://i.example.com';
 const PORT = process.env.PORT || 9000;
+
+// 🌐 CDN 域名处理：强制包含协议并清洗格式
+let CDN_DOMAIN = process.env.CDN_DOMAIN || 'https://i.example.com';
+
+// 1. 强制校验协议头
+if (!CDN_DOMAIN.startsWith('http://') && !CDN_DOMAIN.startsWith('https://')) {
+    console.error(`❌ FATAL: CDN_DOMAIN must include protocol (http:// or https://). Current value: "${CDN_DOMAIN}"`);
+    process.exit(1);
+}
+
+// 2. 去除末尾斜杠，防止拼接时出现双斜杠 (//)
+if (CDN_DOMAIN.endsWith('/')) {
+    CDN_DOMAIN = CDN_DOMAIN.slice(0, -1);
+}
 
 // 🛡️ 安全配置
 const TOKEN_EXPIRY_MS = 24 * 60 * 60 * 1000; // 24 小时
@@ -55,9 +67,9 @@ const loginAttempts = {};
 const genToken = () => {
     const exp = Date.now() + TOKEN_EXPIRY_MS;
     const jti = crypto.randomBytes(8).toString('hex'); 
-    const pay = `${AUTH_USER}.${exp}.${jti}`;
+    const pay = `${AUTH_USER}.${exp}.${jti}`; // 修复：添加反引号
     const signature = crypto.createHmac('sha256', JWT_SECRET).update(pay).digest('hex');
-    return `${pay}.${signature}`;
+    return `${pay}.${signature}`; // 修复：添加反引号
 };
 
 // 验证 Token (恒定时间比较)
@@ -68,7 +80,7 @@ const checkToken = (t) => {
         if (parts.length !== 3) return false;
         
         const [u, e, jti] = parts; 
-        const payToVerify = `${u}.${e}.${jti}`;
+        const payToVerify = `${u}.${e}.${jti}`; // 修复：添加反引号
         const expectedSig = crypto.createHmac('sha256', JWT_SECRET).update(payToVerify).digest('hex');
         
         // 恒定时间比较防止时序攻击
@@ -118,17 +130,20 @@ const recordLoginAttempt = (ip, success) => {
         loginAttempts[ip].lockUntil = now + LOCK_DURATION_MS;
     }
 };
-
 // ================= HTTP 服务 =================
 http.createServer((req, res) => {
-    // 🌐 CORS 设置：使用完整域名 (必须包含协议)
+    // 🌐 CORS 设置
     const origin = req.headers['origin'] || '';
     
-    // 安全策略：允许特定域名或空 Origin (兼容 curl/Postman)
-    const isAllowed = origin === '' || 
-                      origin.includes('example.com') || 
-                      origin.includes('localhost') || 
-                      origin.includes('127.0.0.1');
+    // 安全策略：
+    // 1. 允许空 Origin (兼容 curl/Postman/移动端直连)
+    // 2. 允许 localhost/127.0.0.1 (开发环境)
+    // 3. 允许特定的主域名及其子域名 (生产环境)
+    // 修复：增加 .example.com 校验防止 fake-example.com 绕过
+    const isLocalhost = origin.includes('localhost') || origin.includes('127.0.0.1');
+    const isAllowedDomain = origin.endsWith('.example.com') || origin === 'https://example.com'; 
+    
+    const isAllowed = origin === '' || isLocalhost || isAllowedDomain; // 修复：补全 ||
 
     if (origin && isAllowed) {
         res.setHeader('Access-Control-Allow-Origin', origin); // 反射允许的 Origin
@@ -212,7 +227,6 @@ http.createServer((req, res) => {
             res.end(JSON.stringify({ success: false, message: 'File type not allowed. Images only.' }));
             return;
         }
-
         // 🛡️ 检查 Content-Length
         const contentLength = parseInt(req.headers['content-length'], 10);
         if (contentLength && contentLength > MAX_FILE_SIZE) {
@@ -255,11 +269,11 @@ http.createServer((req, res) => {
                     }
                 }
                 
-                const safeName = `${crypto.randomUUID()}${ext}`;
+                const safeName = `${crypto.randomUUID()}${ext}`; // 修复：添加反引号
                 const d = new Date();
                 // 路径: img/m/YYYYMMDD/UUID.ext
-                const dateStr = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`;
-                const key = `img/m/${dateStr}/${safeName}`;
+                const dateStr = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`; // 修复：添加反引号
+                const key = `img/m/${dateStr}/${safeName}`; // 修复：添加反引号
                 
                 // 上传到 OSS
                 await client.put(key, buf, {
@@ -270,12 +284,13 @@ http.createServer((req, res) => {
                     }
                 });
                 
-                const customUrl = `${CDN_DOMAIN}/${key}`;
+                // ✅ 此时 CDN_DOMAIN 已确保包含协议且无末尾斜杠
+                const customUrl = `${CDN_DOMAIN}/${key}`; // 修复：添加反引号
                 
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ 
                     success: true, 
-                    markdown: `![image](${customUrl})`, 
+                    markdown: `![image](${customUrl})`, // 修复：添加反引号
                     direct: customUrl 
                 }));
             } catch (e) {

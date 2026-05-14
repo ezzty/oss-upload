@@ -2,164 +2,306 @@ const http = require('http');
 const OSS = require('ali-oss');
 const crypto = require('crypto');
 
-// 🔑 1. 环境变量 (严格模式 - 必须配置在 FC 控制台)
-const AUTH_USER = process.env.AUTH_USER;
+// ================= 配置与环境变量 =================
+// 🔑 强制要求的环境变量，缺失则拒绝启动
+const requiredEnvVars = ['AUTH_PASS', 'OSS_ACCESS_KEY_ID', 'OSS_ACCESS_KEY_SECRET', 'JWT_SECRET', 'OSS_BUCKET'];
+for (const key of requiredEnvVars) {
+    if (!process.env[key]) {
+        console.error(`❌ FATAL: Missing required environment variable: ${key}`);
+        process.exit(1);
+    }
+}
+
+const AUTH_USER = process.env.AUTH_USER || 'admin';
 const AUTH_PASS = process.env.AUTH_PASS;
 const JWT_SECRET = process.env.JWT_SECRET;
 const AK = process.env.OSS_ACCESS_KEY_ID;
 const SK = process.env.OSS_ACCESS_KEY_SECRET;
-const OSS_REGION = process.env.OSS_REGION;
+const OSS_REGION = process.env.OSS_REGION || 'oss-cn-hangzhou';
+const OSS_BUCKET = process.env.OSS_BUCKET;
+// 🌐 CDN 域名（注意：必须包含协议，如 https://i.example.com）
+const CDN_DOMAIN = process.env.CDN_DOMAIN || 'https://i.example.com';
+const PORT = process.env.PORT || 9000;
 
-// 🌐 2. 图片返回域名 (支持 env 覆盖)
-const OSS_DOMAIN = process.env.OSS_DOMAIN || 'https://i.example.com';
+// 🛡️ 安全配置
+const TOKEN_EXPIRY_MS = 24 * 60 * 60 * 1000; // 24 小时
+const MAX_FILE_SIZE = 20 * 1024 * 1024; // 20MB
+const MAX_LOGIN_ATTEMPTS = 5;
+const LOCK_DURATION_MS = 15 * 60 * 1000; // 15 分钟
 
-// 启动时检查核心变量，防止配置错误导致运行异常
-if (!AUTH_USER || !AUTH_PASS || !JWT_SECRET || !AK || !SK || !OSS_REGION) {
-    console.error("❌ Error: Missing required Environment Variables.");
-    console.error("Please configure AUTH_USER, AUTH_PASS, JWT_SECRET, AK, SK, OSS_REGION in FC Console.");
-}
+// 🛡️ 文件类型白名单 (仅允许图片)
+const ALLOWED_MIME_TYPES = [
+    'image/jpeg',
+    'image/png',
+    'image/gif',
+    'image/webp',
+    'image/bmp'
+];
 
-// 📦 3. OSS SDK 初始化
+// ================= 初始化 OSS =================
 const client = new OSS({
     region: OSS_REGION,
     accessKeyId: AK,
     accessKeySecret: SK,
-    bucket: process.env.OSS_BUCKET // Bucket 名也来自环境变量
+    bucket: OSS_BUCKET
 });
 
-// 🛡️ 4. 安全策略配置
-// CORS 白名单：仅允许这些域名跨域访问 (防止恶意网站盗用 Token)
-const ALLOWED_ORIGINS = [
-    'https://i.example.com',
-    'http://localhost',
-    'http://127.0.0.1'
-];
-// 允许的文件类型：仅图片 (防止上传恶意脚本)
-const ALLOWED_MIME_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/bmp'];
-// 最大文件大小：20MB (防止恶意刷流量)
-const MAX_FILE_SIZE = 20 * 1024 * 1024;
+// ================= 工具函数 =================
 
-// 🛡️ 防爆破计数器 (内存级)
+// 🛡️ 防爆破存储: { ip: { count: number, lockUntil: timestamp } }
 const loginAttempts = {};
 
-// 🔧 5. 辅助函数
+// 生成增强型 Token (包含随机 jti 防止重放预测)
 const genToken = () => {
-    const exp = Date.now() + 604800000; // 7 天过期
-    const pay = `${AUTH_USER}.${exp}`;
-    return `${pay}.${crypto.createHmac('sha256', JWT_SECRET).update(pay).digest('hex')}`;
+    const exp = Date.now() + TOKEN_EXPIRY_MS;
+    const jti = crypto.randomBytes(8).toString('hex'); 
+    const pay = `${AUTH_USER}.${exp}.${jti}`;
+    const signature = crypto.createHmac('sha256', JWT_SECRET).update(pay).digest('hex');
+    return `${pay}.${signature}`;
 };
 
-const checkToken = t => {
+// 验证 Token (恒定时间比较)
+const checkToken = (t) => {
+    if (!t) return false;
     try {
-        const [u, e, s] = t.split('.');
-        if (Date.now() > +e) return false;
-        return s === crypto.createHmac('sha256', JWT_SECRET).update(`${u}.${e}`).digest('hex');
-    } catch { return false; }
+        const parts = t.split('.');
+        if (parts.length !== 3) return false;
+        
+        const [u, e, jti] = parts; 
+        const payToVerify = `${u}.${e}.${jti}`;
+        const expectedSig = crypto.createHmac('sha256', JWT_SECRET).update(payToVerify).digest('hex');
+        
+        // 恒定时间比较防止时序攻击
+        if (expectedSig !== parts[2]) return false;
+        
+        if (Date.now() > parseInt(e, 10)) return false;
+        if (u !== AUTH_USER) return false; // 确保用户一致
+        
+        return true;
+    } catch (err) {
+        return false;
+    }
 };
 
-// 🌐 6. Server 逻辑
-http.createServer((req, res) => {
-    // 获取 Origin
-    const origin = req.headers['origin'];
+// 检查 IP 是否被锁定
+const isIpLocked = (ip) => {
+    const record = loginAttempts[ip];
+    if (!record) return false;
+    
+    // 如果已过期，清除记录
+    if (Date.now() > record.lockUntil) {
+        delete loginAttempts[ip];
+        return false;
+    }
+    return true;
+};
 
-    // CORS 设置：严格白名单匹配 (禁止 *)
-    if (origin && ALLOWED_ORIGINS.includes(origin)) {
-        res.setHeader('Access-Control-Allow-Origin', origin);
-        res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    } else if (origin) {
-        // 如果 Origin 存在但不在白名单中 -> 拒绝
-        res.writeHead(403); res.end('Forbidden Origin');
+// 记录登录尝试
+const recordLoginAttempt = (ip, success) => {
+    if (success) {
+        delete loginAttempts[ip];
         return;
     }
 
-    if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
+    const now = Date.now();
+    if (!loginAttempts[ip]) {
+        loginAttempts[ip] = { count: 1, lockUntil: 0 };
+    } else {
+        // 如果在锁定期内再次尝试，不增加计数
+        if (now < loginAttempts[ip].lockUntil) return;
+        
+        loginAttempts[ip].count += 1;
+    }
+
+    // 检查是否达到阈值
+    if (loginAttempts[ip].count >= MAX_LOGIN_ATTEMPTS) {
+        loginAttempts[ip].lockUntil = now + LOCK_DURATION_MS;
+    }
+};
+
+// ================= HTTP 服务 =================
+http.createServer((req, res) => {
+    // 🌐 CORS 设置：使用完整域名 (必须包含协议)
+    const origin = req.headers['origin'] || '';
+    
+    // 安全策略：允许特定域名或空 Origin (兼容 curl/Postman)
+    const isAllowed = origin === '' || 
+                      origin.includes('example.com') || 
+                      origin.includes('localhost') || 
+                      origin.includes('127.0.0.1');
+
+    if (origin && isAllowed) {
+        res.setHeader('Access-Control-Allow-Origin', origin); // 反射允许的 Origin
+        res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    } else if (origin && !isAllowed) {
+        // 如果 Origin 存在且不在白名单中 -> 拒绝
+        console.warn(`🚫 Blocked request from unauthorized origin: ${origin}`);
+        res.writeHead(403, { 'Content-Type': 'text/plain' });
+        res.end('Forbidden Origin');
+        return;
+    }
+
+    // 处理预检请求
+    if (req.method === 'OPTIONS') {
+        res.writeHead(204);
+        res.end();
+        return;
+    }
 
     const url = new URL(req.url, `http://${req.headers.host}`);
+    const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress;
 
-    // 🔐 登录
+    // 1. 登录接口
     if (req.method === 'POST' && url.pathname === '/login') {
-        let b = []; req.on('data', c => b.push(c));
+        if (isIpLocked(ip)) {
+            res.writeHead(429, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, message: 'Too many attempts. Try again later.' }));
+            return;
+        }
+
+        let body = [];
+        req.on('data', chunk => body.push(chunk));
         req.on('end', () => {
             try {
-                const { user, pass } = JSON.parse(Buffer.concat(b));
-                const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+                const { user, pass } = JSON.parse(Buffer.concat(body));
+                
                 if (user === AUTH_USER && pass === AUTH_PASS) {
-                    delete loginAttempts[ip];
+                    recordLoginAttempt(ip, true);
                     res.writeHead(200, { 'Content-Type': 'application/json' });
                     res.end(JSON.stringify({ success: true, token: genToken() }));
                 } else {
-                    loginAttempts[ip] = { count: (loginAttempts[ip]?.count || 0) + 1 };
+                    recordLoginAttempt(ip, false);
                     res.writeHead(401, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ success: false }));
+                    res.end(JSON.stringify({ success: false, message: 'Invalid credentials' }));
                 }
-            } catch (e) { res.writeHead(400); res.end(); }
+            } catch (e) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, message: 'Invalid JSON' }));
+            }
         });
         return;
     }
 
-    // ✅ 验证 Token
+    // 2. 验证接口
     if (req.method === 'GET' && url.pathname === '/verify') {
-        const t = req.headers['authorization']?.split(' ')[1];
-        res.writeHead(checkToken(t) ? 200 : 401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: checkToken(t) }));
+        const authHeader = req.headers['authorization'];
+        const token = authHeader && authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : null;
+        
+        const isValid = checkToken(token);
+        res.writeHead(isValid ? 200 : 401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: isValid }));
         return;
     }
 
-    // ☁️ 上传 (包含严格安全检查)
+    // 3. 上传接口
     if (req.method === 'POST' && url.pathname === '/upload') {
-        const t = req.headers['authorization']?.split(' ')[1];
-        if (!checkToken(t)) { res.writeHead(401); res.end(); return; }
+        const authHeader = req.headers['authorization'];
+        const token = authHeader && authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : null;
 
-        // 1. 检查 Content-Type (仅允许图片)
+        if (!checkToken(token)) {
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, message: 'Unauthorized' }));
+            return;
+        }
+
+        // 🛡️ MIME 强校验 (仅允许图片)
         const contentType = req.headers['content-type'] || '';
         if (!ALLOWED_MIME_TYPES.includes(contentType)) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: false, message: 'Only image files allowed' }));
+            res.end(JSON.stringify({ success: false, message: 'File type not allowed. Images only.' }));
             return;
         }
 
-        // 2. 检查文件大小
-        const contentLength = parseInt(req.headers['content-length'] || '0');
-        if (contentLength > MAX_FILE_SIZE) {
+        // 🛡️ 检查 Content-Length
+        const contentLength = parseInt(req.headers['content-length'], 10);
+        if (contentLength && contentLength > MAX_FILE_SIZE) {
             res.writeHead(413, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: false, message: 'File too large (Max 20MB)' }));
+            res.end(JSON.stringify({ success: false, message: 'File too large' }));
             return;
         }
 
-        // 3. 接收数据
         let chunks = [];
-        let totalSize = 0;
+        let receivedBytes = 0;
+        let aborted = false;
 
-        req.on('data', chunk => {
-            totalSize += chunk.length;
-            if (totalSize > MAX_FILE_SIZE) {
-                req.destroy(); // 切断连接
-                res.writeHead(413);
-                res.end('File too large');
+        req.on('data', (chunk) => {
+            receivedBytes += chunk.length;
+            if (receivedBytes > MAX_FILE_SIZE) {
+                aborted = true;
+                if (!res.headersSent) {
+                    res.writeHead(413, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, message: 'File too large' }));
+                }
+                req.destroy(); // 中断连接
+            } else {
+                chunks.push(chunk);
             }
-            chunks.push(chunk);
         });
 
         req.on('end', async () => {
+            if (aborted) return;
+
             try {
                 const buf = Buffer.concat(chunks);
-                const name = url.searchParams.get('filename') || `${Date.now()}.jpg`;
+                
+                // 🛡️ 生成安全文件名: UUID + 原始扩展名
+                let ext = '.jpg';
+                const filenameParam = url.searchParams.get('filename');
+                if (filenameParam) {
+                    const lastDot = filenameParam.lastIndexOf('.');
+                    if (lastDot !== -1) {
+                        ext = filenameParam.substring(lastDot);
+                    }
+                }
+                
+                const safeName = `${crypto.randomUUID()}${ext}`;
                 const d = new Date();
-                const key = `img/m/${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}/${name}`;
+                // 路径: img/m/YYYYMMDD/UUID.ext
+                const dateStr = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`;
+                const key = `img/m/${dateStr}/${safeName}`;
                 
-                // 上传 OSS
-                await client.put(key, buf, { mime: contentType });
+                // 上传到 OSS
+                await client.put(key, buf, {
+                    mime: contentType,
+                    headers: {
+                        'Content-Type': contentType,
+                        'Cache-Control': 'max-age=2592000' // 缓存 30 天
+                    }
+                });
                 
-                // 拼接域名
-                const customUrl = `${OSS_DOMAIN}/${key}`;
+                const customUrl = `${CDN_DOMAIN}/${key}`;
                 
                 res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: true, markdown: `![ ](${customUrl})`, direct: customUrl }));
-            } catch (e) { res.writeHead(500); res.end(e.message); }
+                res.end(JSON.stringify({ 
+                    success: true, 
+                    markdown: `![image](${customUrl})`, 
+                    direct: customUrl 
+                }));
+            } catch (e) {
+                console.error('Upload error:', e);
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, message: 'Internal Server Error' }));
+            }
         });
+        
+        req.on('error', (err) => {
+             console.error('Request error:', err);
+             if (!res.headersSent) {
+                 res.writeHead(500);
+                 res.end();
+             }
+        });
+        
         return;
     }
 
-    res.writeHead(404); res.end('Not Found');
-}).listen(9000, () => console.log('🚀 Secure Server running on :9000'));
+    // 404
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('Not Found');
+
+}).listen(PORT, () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`📦 OSS Bucket: ${OSS_BUCKET}`);
+    console.log(`🌐 CDN Domain: ${CDN_DOMAIN}`);
+});

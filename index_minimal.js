@@ -77,14 +77,14 @@ const checkToken = (t) => {
     if (!t) return false;
     try {
         const parts = t.split('.');
-        if (parts.length !== 3) return false;
+        if (parts.length !== 4) return false;
         
-        const [u, e, jti] = parts; 
+        const [u, e, jti, signature] = parts; 
         const payToVerify = `${u}.${e}.${jti}`; // 修复：添加反引号
         const expectedSig = crypto.createHmac('sha256', JWT_SECRET).update(payToVerify).digest('hex');
         
         // 恒定时间比较防止时序攻击
-        if (expectedSig !== parts[2]) return false;
+        if (expectedSig !== signature) return false;
         
         if (Date.now() > parseInt(e, 10)) return false;
         if (u !== AUTH_USER) return false; // 确保用户一致

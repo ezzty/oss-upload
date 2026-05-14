@@ -16,7 +16,7 @@ const client = new OSS({
     region: process.env.OSS_REGION || 'oss-cn-hangzhou',
     accessKeyId: AK,
     accessKeySecret: SK,
-    bucket: process.env.OSS_BUCKET || 'ifcr'
+    bucket: process.env.OSS_BUCKET
 });
 
 // 🛡️ 防爆破

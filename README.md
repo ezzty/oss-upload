@@ -41,8 +41,8 @@
 | `AUTH_USER` | `admin` | 登录用户名 |
 | `AUTH_PASS` | `你的密码` | 登录密码 |
 | `JWT_SECRET` | `你的随机字符串` | Token 签名密钥 |
-| `OSS_BUCKET` | `ifcr` | (可选) 目标 Bucket 名 |
-| `OSS_REGION` | `oss-cn-hangzhou` | (可选) 区域 |
+| `OSS_BUCKET` | `ifcr` | **必填**：目标 Bucket 名称 |
+| `OSS_REGION` | `oss-cn-hangzhou` | **必填**：Bucket 所在区域 |
 
 5. **部署并启动**：确保监听端口为 `9000`。
 

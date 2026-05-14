@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Artifacts / Packages
+*.zip
+layer.zip
+code_minimal.zip
+
+# OS Files
+.DS_Store
+._*
+Thumbs.db
+
+# Scripts
+upload_to_oss.py
+
+# Logs
+*.log

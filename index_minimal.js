@@ -4,7 +4,7 @@ const crypto = require('crypto');
 
 // ================= 配置与环境变量 =================
 // 🔑 强制要求的环境变量，缺失则拒绝启动
-const requiredEnvVars = ['AUTH_PASS', 'OSS_ACCESS_KEY_ID', 'OSS_ACCESS_KEY_SECRET', 'JWT_SECRET', 'OSS_BUCKET', 'CDN_DOMAIN'];
+const requiredEnvVars = ['AUTH_PASS', 'OSS_ACCESS_KEY_ID', 'OSS_ACCESS_KEY_SECRET', 'JWT_SECRET', 'OSS_BUCKET', 'CDN_DOMAIN', 'AUTH_USER', 'OSS_REGION'];
 for (const key of requiredEnvVars) {
     if (!process.env[key]) {
         console.error(`❌ FATAL: Missing required environment variable: ${key}`);
@@ -12,12 +12,12 @@ for (const key of requiredEnvVars) {
     }
 }
 
-const AUTH_USER = process.env.AUTH_USER || 'admin';
+const AUTH_USER = process.env.AUTH_USER;
 const AUTH_PASS = process.env.AUTH_PASS;
 const JWT_SECRET = process.env.JWT_SECRET;
 const AK = process.env.OSS_ACCESS_KEY_ID;
 const SK = process.env.OSS_ACCESS_KEY_SECRET;
-const OSS_REGION = process.env.OSS_REGION || 'oss-cn-hangzhou';
+const OSS_REGION = process.env.OSS_REGION;
 const OSS_BUCKET = process.env.OSS_BUCKET;
 const PORT = process.env.PORT || 9000;
 

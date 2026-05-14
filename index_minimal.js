@@ -4,7 +4,7 @@ const crypto = require('crypto');
 
 // ================= 配置与环境变量 =================
 // 🔑 强制要求的环境变量，缺失则拒绝启动
-const requiredEnvVars = ['AUTH_PASS', 'OSS_ACCESS_KEY_ID', 'OSS_ACCESS_KEY_SECRET', 'JWT_SECRET', 'OSS_BUCKET'];
+const requiredEnvVars = ['AUTH_PASS', 'OSS_ACCESS_KEY_ID', 'OSS_ACCESS_KEY_SECRET', 'JWT_SECRET', 'OSS_BUCKET', 'CDN_DOMAIN'];
 for (const key of requiredEnvVars) {
     if (!process.env[key]) {
         console.error(`❌ FATAL: Missing required environment variable: ${key}`);
@@ -22,7 +22,7 @@ const OSS_BUCKET = process.env.OSS_BUCKET;
 const PORT = process.env.PORT || 9000;
 
 // 🌐 CDN 域名处理：强制包含协议并清洗格式
-let CDN_DOMAIN = process.env.CDN_DOMAIN || 'https://i.example.com';
+let CDN_DOMAIN = process.env.CDN_DOMAIN;
 
 // 1. 强制校验协议头
 if (!CDN_DOMAIN.startsWith('http://') && !CDN_DOMAIN.startsWith('https://')) {

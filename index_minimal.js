@@ -57,10 +57,36 @@ try {
     process.exit(1);
 }
 
-// 🛡 文件类型白名单 (MIME) - Set 提升查找性能
+// 🛡 文件类型白名单 (MIME)
 const ALLOWED_MIME_TYPES = new Set([
     'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/bmp'
 ]);
+
+// 扩展名映射
+const EXT_MAP = {
+    'image/jpeg': '.jpg', 
+    'image/png': '.png', 
+    'image/gif': '.gif',
+    'image/webp': '.webp', 
+    'image/bmp': '.bmp'
+};
+
+// 🛡 核心安全：内置魔数检测 (零依赖)
+const detectFileType = (buf) => {
+    if (buf.length < 12) return null;
+    // JPEG: FF D8 FF
+    if (buf[0]===0xFF && buf[1]===0xD8 && buf[2]===0xFF) return 'image/jpeg';
+    // PNG: 89 50 4E 47
+    if (buf[0]===0x89 && buf[1]===0x50 && buf[2]===0x4E && buf[3]===0x47) return 'image/png';
+    // GIF: 47 49 46
+    if (buf[0]===0x47 && buf[1]===0x49 && buf[2]===0x46) return 'image/gif';
+    // BMP: 42 4D
+    if (buf[0]===0x42 && buf[1]===0x4D) return 'image/bmp';
+    // WEBP: 52 49 46 46 ... 57 45 42 50
+    if (buf[0]===0x52 && buf[1]===0x49 && buf[2]===0x46 && buf[3]===0x46 && 
+        buf[8]===0x57 && buf[9]===0x45 && buf[10]===0x42 && buf[11]===0x50) return 'image/webp';
+    return null;
+};
 
 // ================= 初始化 OSS =================
 const ossClient = new OSS({
@@ -73,7 +99,7 @@ const ossClient = new OSS({
 // ================= 工具函数 =================
 const loginAttempts = {};
 
-// 定时清理过期记录，防止内存泄漏
+// 定时清理过期记录
 setInterval(() => {
     const now = Date.now();
     let cleaned = 0;
@@ -121,7 +147,7 @@ const checkToken = (t) => {
 const isIpLocked = (ip) => {
     const record = loginAttempts[ip];
     if (!record) return false;
-    if (record.lockUntil === 0) return false; // 未锁定
+    if (record.lockUntil === 0) return false;
     if (Date.now() > record.lockUntil) {
         delete loginAttempts[ip];
         return false;
@@ -254,41 +280,24 @@ http.createServer((req, res) => {
             if (aborted) return;
             try {
                 const buf = Buffer.concat(chunks);
-                const detectFileType = (buf) => {
-    if (buf.length < 12) return null;
-    if (buf[0]===0xFF && buf[1]===0xD8 && buf[2]===0xFF) return 'image/jpeg';
-    if (buf[0]===0x89 && buf[1]===0x50 && buf[2]===0x4E && buf[3]===0x47) return 'image/png';
-    if (buf[0]===0x47 && buf[1]===0x49 && buf[2]===0x46) return 'image/gif';
-    if (buf[0]===0x42 && buf[1]===0x4D) return 'image/bmp';
-    if (buf[0]===0x52 && buf[1]===0x49 && buf[2]===0x46 && buf[3]===0x46 && buf[8]===0x57 && buf[9]===0x45 && buf[10]===0x42 && buf[11]===0x50) return 'image/webp';
-    return null;
-};
-
-const detectedMime = detectFileType(buf);
-const fileType = detectedMime ? { mime: detectedMime } : null;
+                const detectedMime = detectFileType(buf);
                 
-                if (!fileType || !ALLOWED_MIME_TYPES.has(fileType.mime)) {
-                    console.warn(`⚠️ Blocked: header=${contentType}, detected=${fileType?.mime || 'none'}`);
+                if (!detectedMime || !ALLOWED_MIME_TYPES.has(detectedMime)) {
+                    console.warn(`⚠️ Blocked: header=${contentType}, detected=${detectedMime || 'none'}`);
                     sendJson(res, 400, { success: false, message: 'Invalid file content.' }); return;
                 }
 
-                const extMap = {
-                    'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif',
-                    'image/webp': '.webp', 'image/bmp': '.bmp'
-                };
-                const safeExt = extMap[fileType.mime] || '.bin';
+                const safeExt = EXT_MAP[detectedMime] || '.bin';
                 
-                const randomName = crypto.randomBytes(6).toString('hex'); // 12字符
+                const randomName = crypto.randomBytes(6).toString('hex');
                 const d = new Date();
                 const dateStr = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`;
                 const key = `img/m/${dateStr}/${randomName}${safeExt}`;
                 
                 await ossClient.put(key, buf, {
-                    mime: fileType.mime,
                     headers: {
-                        'Content-Type': fileType.mime,
-                        'Cache-Control': 'max-age=2592000',
-                        'x-oss-object-acl': 'public-read'
+                        'Content-Type': detectedMime,
+                        'Cache-Control': 'max-age=2592000'
                     }
                 });
                 

@@ -1,7 +1,6 @@
 const http = require('http');
 const OSS = require('ali-oss');
 const crypto = require('crypto');
-const FileType = require('file-type'); // ⚠️ 需确保 Layer 包含此模块
 
 // ================= 配置与环境变量 =================
 const requiredEnvVars = [
@@ -255,7 +254,18 @@ http.createServer((req, res) => {
             if (aborted) return;
             try {
                 const buf = Buffer.concat(chunks);
-                const fileType = await FileType.fromBuffer(buf);
+                const detectFileType = (buf) => {
+    if (buf.length < 12) return null;
+    if (buf[0]===0xFF && buf[1]===0xD8 && buf[2]===0xFF) return 'image/jpeg';
+    if (buf[0]===0x89 && buf[1]===0x50 && buf[2]===0x4E && buf[3]===0x47) return 'image/png';
+    if (buf[0]===0x47 && buf[1]===0x49 && buf[2]===0x46) return 'image/gif';
+    if (buf[0]===0x42 && buf[1]===0x4D) return 'image/bmp';
+    if (buf[0]===0x52 && buf[1]===0x49 && buf[2]===0x46 && buf[3]===0x46 && buf[8]===0x57 && buf[9]===0x45 && buf[10]===0x42 && buf[11]===0x50) return 'image/webp';
+    return null;
+};
+
+const detectedMime = detectFileType(buf);
+const fileType = detectedMime ? { mime: detectedMime } : null;
                 
                 if (!fileType || !ALLOWED_MIME_TYPES.has(fileType.mime)) {
                     console.warn(`⚠️ Blocked: header=${contentType}, detected=${fileType?.mime || 'none'}`);

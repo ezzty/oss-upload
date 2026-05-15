@@ -67,19 +67,19 @@ const EXT_MAP = {
 // 🛡 核心安全：内置魔数检测 (强化版)
 const detectFileType = (buf) => {
     const len = buf.length;
-    // JPEG: FF D8 FF (3 bytes)
+    // JPEG: FF D8 FF
     if (len >= 3 && buf[0]===0xFF && buf[1]===0xD8 && buf[2]===0xFF) return 'image/jpeg';
-    // PNG: 89 50 4E 47 0D 0A 1A 0A (8 bytes)
+    // PNG: 89 50 4E 47 0D 0A 1A 0A
     if (len >= 8 && buf[0]===0x89 && buf[1]===0x50 && buf[2]===0x4E && buf[3]===0x47 &&
         buf[4]===0x0D && buf[5]===0x0A && buf[6]===0x1A && buf[7]===0x0A) return 'image/png';
-    // GIF: 47 49 46 38 (39|37) 61 (6 bytes) - GIF89a or GIF87a
+    // GIF: 47 49 46 38 (39|37) 61
     if (len >= 6 && buf[0]===0x47 && buf[1]===0x49 && buf[2]===0x46 && buf[3]===0x38 &&
         (buf[4]===0x39 || buf[4]===0x37) && buf[5]===0x61) return 'image/gif';
-    // BMP: 42 4D (2 bytes)
-    if (len >= 2 && buf[0]===0x42 && buf[1]===0x4D) return 'image/bmp';
-    // WEBP: 52 49 46 46 ... 57 45 42 50 (12 bytes)
+    // WEBP: 52 49 46 46 ... 57 45 42 50
     if (len >= 12 && buf[0]===0x52 && buf[1]===0x49 && buf[2]===0x46 && buf[3]===0x46 && 
         buf[8]===0x57 && buf[9]===0x45 && buf[10]===0x42 && buf[11]===0x50) return 'image/webp';
+    // BMP: 42 4D + 非零文件大小 (字节 2-5)
+    if (len >= 6 && buf[0]===0x42 && buf[1]===0x4D && (buf[2]|buf[3]|buf[4]|buf[5]) !== 0) return 'image/bmp';
     return null;
 };
 
@@ -150,7 +150,7 @@ const recordLoginAttempt = (ip, success) => {
 };
 
 const isValidOrigin = (origin) => {
-    if (!origin) return true; // curl/non-browser, no CORS needed
+    if (!origin) return true;
     if (origin.startsWith('http://localhost:') || origin === 'http://localhost' ||
         origin.startsWith('http://127.0.0.1:') || origin === 'http://127.0.0.1') return true;
     try {
@@ -169,31 +169,22 @@ const sendJson = (res, statusCode, data) => {
 // 辅助函数：等待可读事件
 const waitForReadable = (req, timeoutMs) => {
     return new Promise((resolve, reject) => {
-        const timeoutId = setTimeout(() => {
-            cleanup();
-            reject(new Error('Read timeout'));
-        }, timeoutMs);
-
-        const cleanup = () => {
+        const timeoutId = setTimeout(() => cleanup(new Error('Read timeout')), timeoutMs);
+        const cleanup = (err) => {
             clearTimeout(timeoutId);
             req.removeListener('readable', onReadable);
             req.removeListener('end', onEnd);
             req.removeListener('error', onError);
+            if (err) reject(err); else resolve();
         };
-
-        const onReadable = () => { cleanup(); resolve(); };
-        const onEnd = () => { cleanup(); resolve(); }; // Stream might end without more data
-        const onError = (err) => { cleanup(); reject(err); };
+        const onReadable = () => cleanup(null);
+        const onEnd = () => cleanup(null);
+        const onError = (err) => cleanup(err);
 
         req.on('readable', onReadable);
         req.on('end', onEnd);
         req.on('error', onError);
-        
-        // Immediate check
-        if (req.readable) {
-            cleanup();
-            resolve();
-        }
+        if (req.readable) cleanup(null);
     });
 };
 
@@ -201,7 +192,6 @@ const waitForReadable = (req, timeoutMs) => {
 http.createServer((req, res) => {
     const origin = req.headers['origin'] || '';
     
-    // 🛡️ CORS 修复：空 Origin 不发送头
     if (isValidOrigin(origin)) {
         res.setHeader('Access-Control-Allow-Origin', origin);
         res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
@@ -218,26 +208,29 @@ http.createServer((req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const pathname = url.pathname;
 
-    // --- 1. 登录 ---
+    // --- 1. 登录 (修复竞态条件) ---
     if (req.method === 'POST' && pathname === '/login') {
         if (isIpLocked(ip)) { sendJson(res, 429, { success: false, message: 'Too many attempts.' }); return; }
         
         let body = [];
         let receivedSize = 0;
+        let sizeExceeded = false;
+
         req.on('data', chunk => {
             receivedSize += chunk.length;
             if (receivedSize > CONFIG.SECURITY.MAX_LOGIN_BODY_SIZE) {
+                sizeExceeded = true;
                 req.destroy();
                 return;
             }
             body.push(chunk);
         });
         req.on('end', () => {
+            if (sizeExceeded) {
+                sendJson(res, 413, { success: false, message: 'Request body too large' });
+                return;
+            }
             try {
-                if (receivedSize > CONFIG.SECURITY.MAX_LOGIN_BODY_SIZE) {
-                    sendJson(res, 413, { success: false, message: 'Request body too large' });
-                    return;
-                }
                 const { user, pass } = JSON.parse(Buffer.concat(body));
                 if (user === CONFIG.AUTH_USER && pass === CONFIG.AUTH_PASS) {
                     recordLoginAttempt(ip, true);
@@ -245,7 +238,11 @@ http.createServer((req, res) => {
                 } else { recordLoginAttempt(ip, false); sendJson(res, 401, { success: false, message: 'Invalid credentials' }); }
             } catch (e) { sendJson(res, 400, { success: false, message: 'Invalid JSON' }); }
         });
-        req.on('error', () => sendJson(res, 500, { success: false, message: 'Request error' }));
+        req.on('error', () => {
+            if (!res.headersSent) {
+                sendJson(res, sizeExceeded ? 413 : 500, { success: false, message: sizeExceeded ? 'Request body too large' : 'Request error' });
+            }
+        });
         return;
     }
 
@@ -253,13 +250,12 @@ http.createServer((req, res) => {
     if (req.method === 'GET' && pathname === '/verify') {
         const auth = req.headers['authorization'];
         const token = auth && auth.startsWith('Bearer ') ? auth.slice(7) : null;
-        // 优化：只调用一次 checkToken
         const isValid = checkToken(token);
         sendJson(res, isValid ? 200 : 401, { success: isValid });
         return;
     }
 
-    // --- 3. 上传 (高性能流式版) ---
+    // --- 3. 上传 (高性能流式版 - 修复超时/泄漏) ---
     if (req.method === 'POST' && pathname === '/upload') {
         const auth = req.headers['authorization'];
         const token = auth && auth.startsWith('Bearer ') ? auth.slice(7) : null;
@@ -276,18 +272,16 @@ http.createServer((req, res) => {
 
         req.pause(); 
         const timeoutHandle = setTimeout(() => req.destroy(new Error('Read timeout')), CONFIG.SECURITY.READ_TIMEOUT_MS);
+        let uploadStream = null;
 
         (async () => {
             try {
                 let buffer = null;
                 let mime = null;
 
-                // 尝试读取第一个 chunk
                 let chunk = req.read();
-                if (!chunk && !req.readableEnded) {
-                    await waitForReadable(req, CONFIG.SECURITY.READ_TIMEOUT_MS);
-                    chunk = req.read();
-                }
+                if (!chunk && !req.readableEnded) await waitForReadable(req, CONFIG.SECURITY.READ_TIMEOUT_MS);
+                chunk = req.read();
 
                 if (chunk) {
                     if (chunk.length >= 12) {
@@ -295,44 +289,29 @@ http.createServer((req, res) => {
                         buffer = chunk;
                     } else {
                         buffer = chunk;
-                        // 继续读取直到 12 字节
                         while (buffer.length < 12 && !req.readableEnded) {
                             let nextChunk = req.read();
-                            if (!nextChunk) {
-                                await waitForReadable(req, CONFIG.SECURITY.READ_TIMEOUT_MS);
-                                nextChunk = req.read();
-                            }
+                            if (!nextChunk) await waitForReadable(req, CONFIG.SECURITY.READ_TIMEOUT_MS);
+                            nextChunk = req.read();
                             if (!nextChunk) break;
                             buffer = Buffer.concat([buffer, nextChunk]);
                         }
-                        if (buffer.length >= 12) {
-                            mime = detectFileType(buffer.subarray(0, 12));
-                        }
+                        if (buffer.length >= 12) mime = detectFileType(buffer.subarray(0, 12));
                     }
                 }
 
+                // 🚀 核心修复 1：检测通过后立即停止超时，防止大文件上传被误杀
                 clearTimeout(timeoutHandle);
 
-                if (!mime) {
-                    req.destroy();
-                    sendJson(res, 400, { success: false, message: 'Invalid file content' });
-                    return;
-                }
+                if (!mime) { req.destroy(); sendJson(res, 400, { success: false, message: 'Invalid file content' }); return; }
 
-                const uploadStream = new PassThrough();
-                // 错误处理
-                uploadStream.on('error', (err) => {
-                    console.error('Upload stream error:', err);
-                });
+                uploadStream = new PassThrough();
+                uploadStream.on('error', (err) => console.error('Upload stream error:', err));
                 
                 uploadStream.write(buffer);
-
                 if (!req.readableEnded) {
                     req.pipe(uploadStream);
-                    req.on('error', (err) => {
-                        console.error('Request stream error:', err);
-                        uploadStream.destroy();
-                    });
+                    req.on('error', (err) => { console.error('Request stream error:', err); uploadStream.destroy(); });
                 } else {
                     uploadStream.end();
                 }
@@ -344,16 +323,15 @@ http.createServer((req, res) => {
                 const key = `img/m/${dateStr}/${randomName}${ext}`;
                 
                 await ossClient.put(key, uploadStream, {
-                    headers: {
-                        'Content-Type': mime,
-                        'Cache-Control': 'max-age=2592000'
-                    }
+                    headers: { 'Content-Type': mime, 'Cache-Control': 'max-age=2592000' }
                 });
                 
                 const customUrl = `${CONFIG.CDN_DOMAIN}/${key}`;
                 sendJson(res, 200, { success: true, markdown: `![image](${customUrl})`, direct: customUrl });
                 
             } catch (err) {
+                // 🚀 核心修复 2：确保流被清理，防止资源泄漏
+                if (uploadStream) uploadStream.destroy();
                 console.error('Upload error:', err.message);
                 if (!res.headersSent) {
                     const status = err.message.includes('timeout') ? 408 : 500;

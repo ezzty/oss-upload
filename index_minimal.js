@@ -33,7 +33,8 @@ const CONFIG = {
         MAX_FILE_SIZE: 20 * 1024 * 1024,
         MAX_LOGIN_ATTEMPTS: 5,
         LOCK_DURATION_MS: 15 * 60 * 1000,
-        CLEANUP_INTERVAL_MS: 60 * 60 * 1000
+        CLEANUP_INTERVAL_MS: 60 * 60 * 1000,
+        READ_TIMEOUT_MS: 10000 // 头部读取超时 10 秒
     }
 };
 
@@ -64,8 +65,9 @@ const EXT_MAP = {
 };
 
 // 🛡 核心安全：内置魔数检测 (前 12 字节)
+// 优化：直接按位比较，减少函数调用开销
 const detectFileType = (buf) => {
-    if (buf.length < 12) return null;
+    // buf 长度保证 >= 12
     if (buf[0]===0xFF && buf[1]===0xD8 && buf[2]===0xFF) return 'image/jpeg';
     if (buf[0]===0x89 && buf[1]===0x50 && buf[2]===0x4E && buf[3]===0x47) return 'image/png';
     if (buf[0]===0x47 && buf[1]===0x49 && buf[2]===0x46) return 'image/gif';
@@ -177,6 +179,7 @@ http.createServer((req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const pathname = url.pathname;
 
+    // --- 1. 登录 ---
     if (req.method === 'POST' && pathname === '/login') {
         if (isIpLocked(ip)) { sendJson(res, 429, { success: false, message: 'Too many attempts.' }); return; }
         let body = [];
@@ -193,6 +196,7 @@ http.createServer((req, res) => {
         return;
     }
 
+    // --- 2. 验证 ---
     if (req.method === 'GET' && pathname === '/verify') {
         const auth = req.headers['authorization'];
         const token = auth && auth.startsWith('Bearer ') ? auth.slice(7) : null;
@@ -200,6 +204,7 @@ http.createServer((req, res) => {
         return;
     }
 
+    // --- 3. 上传 (高性能流式版) ---
     if (req.method === 'POST' && pathname === '/upload') {
         const auth = req.headers['authorization'];
         const token = auth && auth.startsWith('Bearer ') ? auth.slice(7) : null;
@@ -214,56 +219,104 @@ http.createServer((req, res) => {
             sendJson(res, 413, { success: false, message: 'File too large' }); return;
         }
 
-        // 🚀 流式上传核心逻辑
-        const uploadStream = new PassThrough();
-        let receivedBytes = 0;
+        // 🚀 高性能流式核心逻辑
+        req.pause(); // 暂停数据流，准备手动控制
         
-        let mimePromise = new Promise((resolve, reject) => {
-            let buffer = Buffer.alloc(0);
-            let done = false;
+        // 设置超时，防止慢速攻击
+        const timeoutHandle = setTimeout(() => req.destroy(new Error('Read timeout')), CONFIG.SECURITY.READ_TIMEOUT_MS);
 
-            const onData = (chunk) => {
-                receivedBytes += chunk.length;
-                if (receivedBytes > CONFIG.SECURITY.MAX_FILE_SIZE) {
+        (async () => {
+            try {
+                let buffer = null;
+                let mime = null;
+
+                // 1. 尝试读取第一个 chunk
+                let chunk = req.read();
+                
+                // 如果缓冲区空，等待 readable 事件
+                if (!chunk) {
+                    await new Promise((resolve, reject) => {
+                        const onReadable = () => {
+                            cleanup();
+                            resolve();
+                        };
+                        const onEnd = () => { cleanup(); resolve(); }; // 流可能直接结束
+                        const onError = reject;
+                        const cleanup = () => {
+                            req.removeListener('readable', onReadable);
+                            req.removeListener('end', onEnd);
+                            req.removeListener('error', onError);
+                        };
+                        req.on('readable', onReadable);
+                        req.on('end', onEnd);
+                        req.on('error', onError);
+                    });
+                    chunk = req.read();
+                }
+
+                if (chunk) {
+                    // 性能优化：如果 chunk 足够大，直接 subarray 检测，零拷贝
+                    if (chunk.length >= 12) {
+                        mime = detectFileType(chunk.subarray(0, 12));
+                        buffer = chunk; // 保存引用
+                    } else {
+                        buffer = chunk;
+                        // 如果不够，继续读
+                        while (buffer.length < 12) {
+                            const nextChunk = req.read();
+                            if (!nextChunk) {
+                                // 再次等待
+                                await new Promise((resolve, reject) => {
+                                    const onReadable = () => { cleanup(); resolve(); };
+                                    const onEnd = () => { cleanup(); resolve(); };
+                                    const onError = reject;
+                                    const cleanup = () => {
+                                        req.removeListener('readable', onReadable);
+                                        req.removeListener('end', onEnd);
+                                        req.removeListener('error', onError);
+                                    };
+                                    req.on('readable', onReadable);
+                                    req.on('end', onEnd);
+                                    req.on('error', onError);
+                                });
+                                const c = req.read();
+                                if (!c) break; // 流结束
+                                
+                                // 拼接
+                                buffer = Buffer.concat([buffer, c]);
+                            } else {
+                                buffer = Buffer.concat([buffer, nextChunk]);
+                            }
+                        }
+                        if (buffer.length >= 12) {
+                            mime = detectFileType(buffer.subarray(0, 12));
+                        }
+                    }
+                }
+
+                clearTimeout(timeoutHandle);
+
+                // 2. 校验结果
+                if (!mime || buffer.length < 12) {
                     req.destroy();
-                    uploadStream.destroy();
-                    reject(new Error('Size limit exceeded'));
+                    sendJson(res, 400, { success: false, message: 'Invalid file content' });
                     return;
                 }
 
-                if (!done) {
-                    buffer = Buffer.concat([buffer, chunk]);
-                    if (buffer.length >= 12) {
-                        done = true;
-                        const mime = detectFileType(buffer.subarray(0, 12));
-                        if (!mime) {
-                            req.destroy();
-                            uploadStream.destroy();
-                            reject(new Error('Invalid file content'));
-                            return;
-                        }
-                        resolve(mime);
-                        req.removeListener('data', onData);
-                        req.removeListener('end', onEnd);
-                        
-                        // 将截留的头部写入流，然后接管剩余流
-                        uploadStream.write(buffer);
-                        req.pipe(uploadStream);
-                    }
+                // 3. 构建上传流并 Pipe
+                const uploadStream = new PassThrough();
+                
+                // 将已读取的数据推入流
+                uploadStream.write(buffer);
+
+                // 如果请求还没结束，接管剩余流
+                if (!req.readableEnded) {
+                    req.pipe(uploadStream);
+                } else {
+                    uploadStream.end();
                 }
-            };
 
-            const onEnd = () => {
-                if (!done) reject(new Error('File too small'));
-            };
-
-            req.on('data', onData);
-            req.on('end', onEnd);
-            req.on('error', reject);
-        });
-
-        mimePromise.then(async (mime) => {
-            try {
+                // 4. 执行上传
                 const randomName = crypto.randomBytes(3).toString('hex');
                 const d = new Date();
                 const dateStr = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`;
@@ -279,16 +332,15 @@ http.createServer((req, res) => {
                 
                 const customUrl = `${CONFIG.CDN_DOMAIN}/${key}`;
                 sendJson(res, 200, { success: true, markdown: `![image](${customUrl})`, direct: customUrl });
-            } catch (e) {
-                console.error('Upload error:', e);
-                sendJson(res, 500, { success: false, message: 'Upload failed' });
+                
+            } catch (err) {
+                console.error('Upload error:', err.message);
+                if (!res.headersSent) {
+                    const status = err.message.includes('timeout') ? 408 : 500;
+                    sendJson(res, status, { success: false, message: 'Upload failed' });
+                }
             }
-        }).catch(err => {
-            if (!res.headersSent) {
-                const isSize = err.message === 'Size limit exceeded';
-                sendJson(res, isSize ? 413 : 400, { success: false, message: err.message });
-            }
-        });
+        })();
 
         return;
     }

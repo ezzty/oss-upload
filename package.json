@@ -10,6 +10,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "ali-oss": "^6.23.0"
+    "ali-oss": "^6.23.0",
+    "file-type": "^19.6.0"
   }
 }

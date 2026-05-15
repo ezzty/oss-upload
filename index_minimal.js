@@ -1,17 +1,12 @@
 const http = require('http');
 const OSS = require('ali-oss');
 const crypto = require('crypto');
+const { PassThrough } = require('stream');
 
 // ================= 配置与环境变量 =================
 const requiredEnvVars = [
-    'AUTH_PASS', 
-    'OSS_ACCESS_KEY_ID', 
-    'OSS_ACCESS_KEY_SECRET', 
-    'JWT_SECRET', 
-    'OSS_BUCKET', 
-    'CDN_DOMAIN', 
-    'AUTH_USER', 
-    'OSS_REGION'
+    'AUTH_PASS', 'OSS_ACCESS_KEY_ID', 'OSS_ACCESS_KEY_SECRET', 
+    'JWT_SECRET', 'OSS_BUCKET', 'CDN_DOMAIN', 'AUTH_USER', 'OSS_REGION'
 ];
 
 for (const key of requiredEnvVars) {
@@ -57,32 +52,24 @@ try {
     process.exit(1);
 }
 
-// 🛡 文件类型白名单 (MIME)
+// 🛡 文件类型白名单
 const ALLOWED_MIME_TYPES = new Set([
     'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/bmp'
 ]);
 
 // 扩展名映射
 const EXT_MAP = {
-    'image/jpeg': '.jpg', 
-    'image/png': '.png', 
-    'image/gif': '.gif',
-    'image/webp': '.webp', 
-    'image/bmp': '.bmp'
+    'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif',
+    'image/webp': '.webp', 'image/bmp': '.bmp'
 };
 
-// 🛡 核心安全：内置魔数检测 (零依赖)
+// 🛡 核心安全：内置魔数检测 (前 12 字节)
 const detectFileType = (buf) => {
     if (buf.length < 12) return null;
-    // JPEG: FF D8 FF
     if (buf[0]===0xFF && buf[1]===0xD8 && buf[2]===0xFF) return 'image/jpeg';
-    // PNG: 89 50 4E 47
     if (buf[0]===0x89 && buf[1]===0x50 && buf[2]===0x4E && buf[3]===0x47) return 'image/png';
-    // GIF: 47 49 46
     if (buf[0]===0x47 && buf[1]===0x49 && buf[2]===0x46) return 'image/gif';
-    // BMP: 42 4D
     if (buf[0]===0x42 && buf[1]===0x4D) return 'image/bmp';
-    // WEBP: 52 49 46 46 ... 57 45 42 50
     if (buf[0]===0x52 && buf[1]===0x49 && buf[2]===0x46 && buf[3]===0x46 && 
         buf[8]===0x57 && buf[9]===0x45 && buf[10]===0x42 && buf[11]===0x50) return 'image/webp';
     return null;
@@ -99,7 +86,6 @@ const ossClient = new OSS({
 // ================= 工具函数 =================
 const loginAttempts = {};
 
-// 定时清理过期记录
 setInterval(() => {
     const now = Date.now();
     let cleaned = 0;
@@ -125,48 +111,30 @@ const checkToken = (t) => {
     try {
         const parts = t.split('.');
         if (parts.length !== 4) return false;
-        
         const [u, e, jti, signature] = parts; 
         const payloadToVerify = `${u}.${e}.${jti}`;
         const expectedSig = crypto.createHmac('sha256', CONFIG.JWT_SECRET).update(payloadToVerify).digest('hex');
-        
-        if (!crypto.timingSafeEqual(Buffer.from(expectedSig), Buffer.from(signature))) {
-            return false;
-        }
-        
+        if (!crypto.timingSafeEqual(Buffer.from(expectedSig), Buffer.from(signature))) return false;
         const expiry = parseInt(e, 10);
         if (isNaN(expiry) || Date.now() > expiry) return false;
         if (u !== CONFIG.AUTH_USER) return false;
-        
         return true;
-    } catch (err) {
-        return false;
-    }
+    } catch (err) { return false; }
 };
 
 const isIpLocked = (ip) => {
     const record = loginAttempts[ip];
     if (!record) return false;
     if (record.lockUntil === 0) return false;
-    if (Date.now() > record.lockUntil) {
-        delete loginAttempts[ip];
-        return false;
-    }
+    if (Date.now() > record.lockUntil) { delete loginAttempts[ip]; return false; }
     return true;
 };
 
 const recordLoginAttempt = (ip, success) => {
-    if (success) {
-        delete loginAttempts[ip];
-        return;
-    }
+    if (success) { delete loginAttempts[ip]; return; }
     const now = Date.now();
-    if (!loginAttempts[ip]) {
-        loginAttempts[ip] = { count: 1, lockUntil: 0 };
-    } else {
-        if (now < loginAttempts[ip].lockUntil) return;
-        loginAttempts[ip].count += 1;
-    }
+    if (!loginAttempts[ip]) loginAttempts[ip] = { count: 1, lockUntil: 0 };
+    else { if (now < loginAttempts[ip].lockUntil) return; loginAttempts[ip].count += 1; }
     if (loginAttempts[ip].count >= CONFIG.SECURITY.MAX_LOGIN_ATTEMPTS) {
         loginAttempts[ip].lockUntil = now + CONFIG.SECURITY.LOCK_DURATION_MS;
         console.warn(`🔒 IP ${ip} locked.`);
@@ -176,16 +144,12 @@ const recordLoginAttempt = (ip, success) => {
 const isValidOrigin = (origin) => {
     if (!origin) return true;
     if (origin.startsWith('http://localhost:') || origin === 'http://localhost' ||
-        origin.startsWith('http://127.0.0.1:') || origin === 'http://127.0.0.1') {
-        return true;
-    }
+        origin.startsWith('http://127.0.0.1:') || origin === 'http://127.0.0.1') return true;
     try {
         const url = new URL(origin);
         const h = url.hostname;
         return h === 'example.com' || h.endsWith('.example.com');
-    } catch (e) {
-        return false;
-    }
+    } catch (e) { return false; }
 };
 
 const sendJson = (res, statusCode, data) => {
@@ -197,7 +161,6 @@ const sendJson = (res, statusCode, data) => {
 // ================= HTTP 服务 =================
 http.createServer((req, res) => {
     const origin = req.headers['origin'] || '';
-    
     if (isValidOrigin(origin)) {
         res.setHeader('Access-Control-Allow-Origin', origin);
         res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
@@ -208,18 +171,14 @@ http.createServer((req, res) => {
         return;
     }
 
-    if (req.method === 'OPTIONS') {
-        res.writeHead(204); res.end(); return;
-    }
+    if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
     const ip = req.headers['x-forwarded-for']?.split(',')[0].trim() || req.socket.remoteAddress;
     const url = new URL(req.url, `http://${req.headers.host}`);
     const pathname = url.pathname;
 
     if (req.method === 'POST' && pathname === '/login') {
-        if (isIpLocked(ip)) {
-            sendJson(res, 429, { success: false, message: 'Too many attempts.' }); return;
-        }
+        if (isIpLocked(ip)) { sendJson(res, 429, { success: false, message: 'Too many attempts.' }); return; }
         let body = [];
         req.on('data', chunk => body.push(chunk));
         req.on('end', () => {
@@ -228,13 +187,8 @@ http.createServer((req, res) => {
                 if (user === CONFIG.AUTH_USER && pass === CONFIG.AUTH_PASS) {
                     recordLoginAttempt(ip, true);
                     sendJson(res, 200, { success: true, token: genToken() });
-                } else {
-                    recordLoginAttempt(ip, false);
-                    sendJson(res, 401, { success: false, message: 'Invalid credentials' });
-                }
-            } catch (e) {
-                sendJson(res, 400, { success: false, message: 'Invalid JSON' });
-            }
+                } else { recordLoginAttempt(ip, false); sendJson(res, 401, { success: false, message: 'Invalid credentials' }); }
+            } catch (e) { sendJson(res, 400, { success: false, message: 'Invalid JSON' }); }
         });
         return;
     }
@@ -250,75 +204,92 @@ http.createServer((req, res) => {
         const auth = req.headers['authorization'];
         const token = auth && auth.startsWith('Bearer ') ? auth.slice(7) : null;
 
-        if (!checkToken(token)) {
-            sendJson(res, 401, { success: false, message: 'Unauthorized' }); return;
-        }
+        if (!checkToken(token)) { sendJson(res, 401, { success: false, message: 'Unauthorized' }); return; }
 
         const contentType = req.headers['content-type']?.split(';')[0].trim() || '';
-        if (!ALLOWED_MIME_TYPES.has(contentType)) {
-            sendJson(res, 400, { success: false, message: 'File type not allowed.' }); return;
-        }
+        if (!ALLOWED_MIME_TYPES.has(contentType)) { sendJson(res, 400, { success: false, message: 'File type not allowed.' }); return; }
 
         const contentLength = parseInt(req.headers['content-length'], 10);
         if (contentLength && contentLength > CONFIG.SECURITY.MAX_FILE_SIZE) {
             sendJson(res, 413, { success: false, message: 'File too large' }); return;
         }
 
-        let chunks = [];
+        // 🚀 流式上传核心逻辑
+        const uploadStream = new PassThrough();
         let receivedBytes = 0;
-        let aborted = false;
+        
+        let mimePromise = new Promise((resolve, reject) => {
+            let buffer = Buffer.alloc(0);
+            let done = false;
 
-        req.on('data', chunk => {
-            receivedBytes += chunk.length;
-            if (receivedBytes > CONFIG.SECURITY.MAX_FILE_SIZE) {
-                aborted = true; req.destroy();
-                sendJson(res, 413, { success: false, message: 'File too large' });
-            } else { chunks.push(chunk); }
-        });
-
-        req.on('end', async () => {
-            if (aborted) return;
-            try {
-                const buf = Buffer.concat(chunks);
-                const detectedMime = detectFileType(buf);
-                
-                if (!detectedMime || !ALLOWED_MIME_TYPES.has(detectedMime)) {
-                    console.warn(`⚠️ Blocked: header=${contentType}, detected=${detectedMime || 'none'}`);
-                    sendJson(res, 400, { success: false, message: 'Invalid file content.' }); return;
+            const onData = (chunk) => {
+                receivedBytes += chunk.length;
+                if (receivedBytes > CONFIG.SECURITY.MAX_FILE_SIZE) {
+                    req.destroy();
+                    uploadStream.destroy();
+                    reject(new Error('Size limit exceeded'));
+                    return;
                 }
 
-                const safeExt = EXT_MAP[detectedMime] || '.bin';
-                
+                if (!done) {
+                    buffer = Buffer.concat([buffer, chunk]);
+                    if (buffer.length >= 12) {
+                        done = true;
+                        const mime = detectFileType(buffer.subarray(0, 12));
+                        if (!mime) {
+                            req.destroy();
+                            uploadStream.destroy();
+                            reject(new Error('Invalid file content'));
+                            return;
+                        }
+                        resolve(mime);
+                        req.removeListener('data', onData);
+                        req.removeListener('end', onEnd);
+                        
+                        // 将截留的头部写入流，然后接管剩余流
+                        uploadStream.write(buffer);
+                        req.pipe(uploadStream);
+                    }
+                }
+            };
+
+            const onEnd = () => {
+                if (!done) reject(new Error('File too small'));
+            };
+
+            req.on('data', onData);
+            req.on('end', onEnd);
+            req.on('error', reject);
+        });
+
+        mimePromise.then(async (mime) => {
+            try {
                 const randomName = crypto.randomBytes(3).toString('hex');
                 const d = new Date();
                 const dateStr = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`;
-                const key = `img/m/${dateStr}/${randomName}${safeExt}`;
+                const ext = EXT_MAP[mime] || '.bin';
+                const key = `img/m/${dateStr}/${randomName}${ext}`;
                 
-                await ossClient.put(key, buf, {
+                await ossClient.put(key, uploadStream, {
                     headers: {
-                        'Content-Type': detectedMime,
+                        'Content-Type': mime,
                         'Cache-Control': 'max-age=2592000'
                     }
                 });
                 
                 const customUrl = `${CONFIG.CDN_DOMAIN}/${key}`;
-                sendJson(res, 200, { 
-                    success: true, 
-                    markdown: `![image](${customUrl})`,
-                    direct: customUrl 
-                });
+                sendJson(res, 200, { success: true, markdown: `![image](${customUrl})`, direct: customUrl });
             } catch (e) {
                 console.error('Upload error:', e);
-                sendJson(res, 500, { success: false, message: 'Internal Server Error' });
+                sendJson(res, 500, { success: false, message: 'Upload failed' });
+            }
+        }).catch(err => {
+            if (!res.headersSent) {
+                const isSize = err.message === 'Size limit exceeded';
+                sendJson(res, isSize ? 413 : 400, { success: false, message: err.message });
             }
         });
-        
-        req.on('error', err => {
-             console.error('Stream error:', err);
-             if (!res.headersSent) {
-                 sendJson(res, 500, { success: false, message: 'Connection error' });
-             }
-        });
+
         return;
     }
 

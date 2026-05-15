@@ -289,7 +289,7 @@ http.createServer((req, res) => {
 
                 const safeExt = EXT_MAP[detectedMime] || '.bin';
                 
-                const randomName = crypto.randomBytes(6).toString('hex');
+                const randomName = crypto.randomBytes(3).toString('hex');
                 const d = new Date();
                 const dateStr = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`;
                 const key = `img/m/${dateStr}/${randomName}${safeExt}`;

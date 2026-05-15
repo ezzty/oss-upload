@@ -31,10 +31,11 @@ const CONFIG = {
     SECURITY: {
         TOKEN_EXPIRY_MS: 24 * 60 * 60 * 1000,
         MAX_FILE_SIZE: 20 * 1024 * 1024,
+        MAX_LOGIN_BODY_SIZE: 4 * 1024, // 4KB
         MAX_LOGIN_ATTEMPTS: 5,
         LOCK_DURATION_MS: 15 * 60 * 1000,
         CLEANUP_INTERVAL_MS: 60 * 60 * 1000,
-        READ_TIMEOUT_MS: 10000 // 头部读取超时 10 秒
+        READ_TIMEOUT_MS: 10000
     }
 };
 
@@ -58,21 +59,26 @@ const ALLOWED_MIME_TYPES = new Set([
     'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/bmp'
 ]);
 
-// 扩展名映射
 const EXT_MAP = {
     'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif',
     'image/webp': '.webp', 'image/bmp': '.bmp'
 };
 
-// 🛡 核心安全：内置魔数检测 (前 12 字节)
-// 优化：直接按位比较，减少函数调用开销
+// 🛡 核心安全：内置魔数检测 (强化版)
 const detectFileType = (buf) => {
-    // buf 长度保证 >= 12
-    if (buf[0]===0xFF && buf[1]===0xD8 && buf[2]===0xFF) return 'image/jpeg';
-    if (buf[0]===0x89 && buf[1]===0x50 && buf[2]===0x4E && buf[3]===0x47) return 'image/png';
-    if (buf[0]===0x47 && buf[1]===0x49 && buf[2]===0x46) return 'image/gif';
-    if (buf[0]===0x42 && buf[1]===0x4D) return 'image/bmp';
-    if (buf[0]===0x52 && buf[1]===0x49 && buf[2]===0x46 && buf[3]===0x46 && 
+    const len = buf.length;
+    // JPEG: FF D8 FF (3 bytes)
+    if (len >= 3 && buf[0]===0xFF && buf[1]===0xD8 && buf[2]===0xFF) return 'image/jpeg';
+    // PNG: 89 50 4E 47 0D 0A 1A 0A (8 bytes)
+    if (len >= 8 && buf[0]===0x89 && buf[1]===0x50 && buf[2]===0x4E && buf[3]===0x47 &&
+        buf[4]===0x0D && buf[5]===0x0A && buf[6]===0x1A && buf[7]===0x0A) return 'image/png';
+    // GIF: 47 49 46 38 (39|37) 61 (6 bytes) - GIF89a or GIF87a
+    if (len >= 6 && buf[0]===0x47 && buf[1]===0x49 && buf[2]===0x46 && buf[3]===0x38 &&
+        (buf[4]===0x39 || buf[4]===0x37) && buf[5]===0x61) return 'image/gif';
+    // BMP: 42 4D (2 bytes)
+    if (len >= 2 && buf[0]===0x42 && buf[1]===0x4D) return 'image/bmp';
+    // WEBP: 52 49 46 46 ... 57 45 42 50 (12 bytes)
+    if (len >= 12 && buf[0]===0x52 && buf[1]===0x49 && buf[2]===0x46 && buf[3]===0x46 && 
         buf[8]===0x57 && buf[9]===0x45 && buf[10]===0x42 && buf[11]===0x50) return 'image/webp';
     return null;
 };
@@ -144,7 +150,7 @@ const recordLoginAttempt = (ip, success) => {
 };
 
 const isValidOrigin = (origin) => {
-    if (!origin) return true;
+    if (!origin) return true; // curl/non-browser, no CORS needed
     if (origin.startsWith('http://localhost:') || origin === 'http://localhost' ||
         origin.startsWith('http://127.0.0.1:') || origin === 'http://127.0.0.1') return true;
     try {
@@ -160,9 +166,42 @@ const sendJson = (res, statusCode, data) => {
     res.end(JSON.stringify(data));
 };
 
+// 辅助函数：等待可读事件
+const waitForReadable = (req, timeoutMs) => {
+    return new Promise((resolve, reject) => {
+        const timeoutId = setTimeout(() => {
+            cleanup();
+            reject(new Error('Read timeout'));
+        }, timeoutMs);
+
+        const cleanup = () => {
+            clearTimeout(timeoutId);
+            req.removeListener('readable', onReadable);
+            req.removeListener('end', onEnd);
+            req.removeListener('error', onError);
+        };
+
+        const onReadable = () => { cleanup(); resolve(); };
+        const onEnd = () => { cleanup(); resolve(); }; // Stream might end without more data
+        const onError = (err) => { cleanup(); reject(err); };
+
+        req.on('readable', onReadable);
+        req.on('end', onEnd);
+        req.on('error', onError);
+        
+        // Immediate check
+        if (req.readable) {
+            cleanup();
+            resolve();
+        }
+    });
+};
+
 // ================= HTTP 服务 =================
 http.createServer((req, res) => {
     const origin = req.headers['origin'] || '';
+    
+    // 🛡️ CORS 修复：空 Origin 不发送头
     if (isValidOrigin(origin)) {
         res.setHeader('Access-Control-Allow-Origin', origin);
         res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
@@ -182,10 +221,23 @@ http.createServer((req, res) => {
     // --- 1. 登录 ---
     if (req.method === 'POST' && pathname === '/login') {
         if (isIpLocked(ip)) { sendJson(res, 429, { success: false, message: 'Too many attempts.' }); return; }
+        
         let body = [];
-        req.on('data', chunk => body.push(chunk));
+        let receivedSize = 0;
+        req.on('data', chunk => {
+            receivedSize += chunk.length;
+            if (receivedSize > CONFIG.SECURITY.MAX_LOGIN_BODY_SIZE) {
+                req.destroy();
+                return;
+            }
+            body.push(chunk);
+        });
         req.on('end', () => {
             try {
+                if (receivedSize > CONFIG.SECURITY.MAX_LOGIN_BODY_SIZE) {
+                    sendJson(res, 413, { success: false, message: 'Request body too large' });
+                    return;
+                }
                 const { user, pass } = JSON.parse(Buffer.concat(body));
                 if (user === CONFIG.AUTH_USER && pass === CONFIG.AUTH_PASS) {
                     recordLoginAttempt(ip, true);
@@ -193,6 +245,7 @@ http.createServer((req, res) => {
                 } else { recordLoginAttempt(ip, false); sendJson(res, 401, { success: false, message: 'Invalid credentials' }); }
             } catch (e) { sendJson(res, 400, { success: false, message: 'Invalid JSON' }); }
         });
+        req.on('error', () => sendJson(res, 500, { success: false, message: 'Request error' }));
         return;
     }
 
@@ -200,7 +253,9 @@ http.createServer((req, res) => {
     if (req.method === 'GET' && pathname === '/verify') {
         const auth = req.headers['authorization'];
         const token = auth && auth.startsWith('Bearer ') ? auth.slice(7) : null;
-        sendJson(res, checkToken(token) ? 200 : 401, { success: !!checkToken(token) });
+        // 优化：只调用一次 checkToken
+        const isValid = checkToken(token);
+        sendJson(res, isValid ? 200 : 401, { success: isValid });
         return;
     }
 
@@ -219,10 +274,7 @@ http.createServer((req, res) => {
             sendJson(res, 413, { success: false, message: 'File too large' }); return;
         }
 
-        // 🚀 高性能流式核心逻辑
-        req.pause(); // 暂停数据流，准备手动控制
-        
-        // 设置超时，防止慢速攻击
+        req.pause(); 
         const timeoutHandle = setTimeout(() => req.destroy(new Error('Read timeout')), CONFIG.SECURITY.READ_TIMEOUT_MS);
 
         (async () => {
@@ -230,63 +282,28 @@ http.createServer((req, res) => {
                 let buffer = null;
                 let mime = null;
 
-                // 1. 尝试读取第一个 chunk
+                // 尝试读取第一个 chunk
                 let chunk = req.read();
-                
-                // 如果缓冲区空，等待 readable 事件
-                if (!chunk) {
-                    await new Promise((resolve, reject) => {
-                        const onReadable = () => {
-                            cleanup();
-                            resolve();
-                        };
-                        const onEnd = () => { cleanup(); resolve(); }; // 流可能直接结束
-                        const onError = reject;
-                        const cleanup = () => {
-                            req.removeListener('readable', onReadable);
-                            req.removeListener('end', onEnd);
-                            req.removeListener('error', onError);
-                        };
-                        req.on('readable', onReadable);
-                        req.on('end', onEnd);
-                        req.on('error', onError);
-                    });
+                if (!chunk && !req.readableEnded) {
+                    await waitForReadable(req, CONFIG.SECURITY.READ_TIMEOUT_MS);
                     chunk = req.read();
                 }
 
                 if (chunk) {
-                    // 性能优化：如果 chunk 足够大，直接 subarray 检测，零拷贝
                     if (chunk.length >= 12) {
                         mime = detectFileType(chunk.subarray(0, 12));
-                        buffer = chunk; // 保存引用
+                        buffer = chunk;
                     } else {
                         buffer = chunk;
-                        // 如果不够，继续读
-                        while (buffer.length < 12) {
-                            const nextChunk = req.read();
+                        // 继续读取直到 12 字节
+                        while (buffer.length < 12 && !req.readableEnded) {
+                            let nextChunk = req.read();
                             if (!nextChunk) {
-                                // 再次等待
-                                await new Promise((resolve, reject) => {
-                                    const onReadable = () => { cleanup(); resolve(); };
-                                    const onEnd = () => { cleanup(); resolve(); };
-                                    const onError = reject;
-                                    const cleanup = () => {
-                                        req.removeListener('readable', onReadable);
-                                        req.removeListener('end', onEnd);
-                                        req.removeListener('error', onError);
-                                    };
-                                    req.on('readable', onReadable);
-                                    req.on('end', onEnd);
-                                    req.on('error', onError);
-                                });
-                                const c = req.read();
-                                if (!c) break; // 流结束
-                                
-                                // 拼接
-                                buffer = Buffer.concat([buffer, c]);
-                            } else {
-                                buffer = Buffer.concat([buffer, nextChunk]);
+                                await waitForReadable(req, CONFIG.SECURITY.READ_TIMEOUT_MS);
+                                nextChunk = req.read();
                             }
+                            if (!nextChunk) break;
+                            buffer = Buffer.concat([buffer, nextChunk]);
                         }
                         if (buffer.length >= 12) {
                             mime = detectFileType(buffer.subarray(0, 12));
@@ -296,27 +313,30 @@ http.createServer((req, res) => {
 
                 clearTimeout(timeoutHandle);
 
-                // 2. 校验结果
-                if (!mime || buffer.length < 12) {
+                if (!mime) {
                     req.destroy();
                     sendJson(res, 400, { success: false, message: 'Invalid file content' });
                     return;
                 }
 
-                // 3. 构建上传流并 Pipe
                 const uploadStream = new PassThrough();
+                // 错误处理
+                uploadStream.on('error', (err) => {
+                    console.error('Upload stream error:', err);
+                });
                 
-                // 将已读取的数据推入流
                 uploadStream.write(buffer);
 
-                // 如果请求还没结束，接管剩余流
                 if (!req.readableEnded) {
                     req.pipe(uploadStream);
+                    req.on('error', (err) => {
+                        console.error('Request stream error:', err);
+                        uploadStream.destroy();
+                    });
                 } else {
                     uploadStream.end();
                 }
 
-                // 4. 执行上传
                 const randomName = crypto.randomBytes(3).toString('hex');
                 const d = new Date();
                 const dateStr = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`;

@@ -259,19 +259,19 @@ http.createServer((req, res) => {
             try {
                 const buf = Buffer.concat(chunks);
                 
-                // 🛡️ 生成安全文件名: UUID + 原始扩展名
+                // 🛡️ 生成安全文件名: Nano ID 6 位 + 原始扩展名
                 let ext = '.jpg';
                 const filenameParam = url.searchParams.get('filename');
                 if (filenameParam) {
                     const lastDot = filenameParam.lastIndexOf('.');
                     if (lastDot !== -1) {
-                        ext = filenameParam.substring(lastDot);
+                        ext = filenameParam.substring(lastDot).toLowerCase();
                     }
                 }
                 
-                const safeName = `${crypto.randomUUID()}${ext}`; // 修复：添加反引号
+                const safeName = `${crypto.randomBytes(3).toString('hex')}${ext}`;
                 const d = new Date();
-                // 路径: img/m/YYYYMMDD/UUID.ext
+                // 路径: img/m/YYYYMMDD/{NanoID6}.ext
                 const dateStr = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`; // 修复：添加反引号
                 const key = `img/m/${dateStr}/${safeName}`; // 修复：添加反引号
                 

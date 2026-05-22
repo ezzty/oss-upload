@@ -34,13 +34,13 @@
 | 变量名 (Key) | 示例值 | 说明 | 必填 |
 | :--- | :--- | :--- | :---: |
 | `AUTH_USER` | `admin` | 登录用户名 | ✅ |
-| `AUTH_PASS` | `Tupm20158@` | 登录密码 | ✅ |
+| `AUTH_PASS` | `Tu1111111` | 登录密码 | ✅ |
 | `JWT_SECRET` | `my-secret-key...` | Token 加密密钥 (建议复杂随机串) | ✅ |
 | `OSS_ACCESS_KEY_ID` | `LTAI...` | 阿里云 AccessKey ID | ✅ |
 | `OSS_ACCESS_KEY_SECRET` | `<your-accesskey-secret>` | 阿里云 AccessKey Secret | ✅ |
-| `OSS_BUCKET` | `ifcr` | 目标 Bucket 名称 | ✅ |
+| `OSS_BUCKET` | `ioss` | 目标 Bucket 名称 | ✅ |
 | `OSS_REGION` | `oss-cn-hangzhou` | Bucket 所在地域 ID | ✅ |
-| `CDN_DOMAIN` | `https://i.example.com` | **必须包含协议**，图片访问/返回域名 | ✅ |
+| `CDN_DOMAIN` | `https://imageoss.com` | **必须包含协议**，图片访问/返回域名 | ✅ |
 | `PORT` | `9000` | 服务监听端口 (默认 9000) | ❌ |
 
 5. 保存并部署。
@@ -50,9 +50,9 @@
 2. **修改配置**：打开 HTML 文件，找到 `_FC_PARTS` 数组，修改为你的**函数计算自定义域名** (API 域名)。
    ```javascript
    // 修改为你的 API 域名，例如:
-   const _FC_PARTS = ['https://', 'uposs-api.example.com'];
+   const _FC_PARTS = ['https://', 'api.imageoss.com'];
    ```
-3. **CORS 注意**：函数代码默认允许 `*.example.com` 来源。如果前端部署在其他域名，需修改 `index_minimal.js` 中的 `isAllowedDomain` 逻辑。
+3. **CORS 注意**：函数代码默认允许 `*.imageoss.com` 来源。如果前端部署在其他域名，需修改 `index_minimal.js` 中的 `isAllowedDomain` 逻辑。
 
 ---
 

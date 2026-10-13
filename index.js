@@ -84,21 +84,31 @@ const ossClient = new OSS({
 });
 
 // ================= 工具函数 =================
-const loginAttempts = {};
+// 用 Map 而非普通对象：天然免疫原型污染（X-Forwarded-For 传 __proto__ 不会污染 Object.prototype）
+const loginAttempts = new Map();
+const MAX_TRACKED_IPS = 1000;
 
-setInterval(() => {
-    const now = Date.now();
-    let cleaned = 0;
-    for (const ip in loginAttempts) {
-        const record = loginAttempts[ip];
-        const lastAccess = record.lastAccess || 0;
-        if (now - lastAccess > CONFIG.SECURITY.CLEANUP_INTERVAL_MS) {
-            delete loginAttempts[ip];
-            cleaned++;
+// 只接受形如 IPv4 / IPv6 的值，杜绝 __proto__、constructor 等特殊键
+const isValidIp = (ip) =>
+    typeof ip === 'string' &&
+    (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(ip) || ip.includes(':')) &&
+    ip.length <= 45;
+
+// 惰性清理：在每次 /login 时顺带做，不依赖 setInterval
+// （FC 实例空闲会被冻结、销毁会丢定时器，全局定时器在 FC 里不可靠）
+const cleanupLoginAttempts = (now) => {
+    if (loginAttempts.size < MAX_TRACKED_IPS) return;
+    for (const [ip, record] of loginAttempts) {
+        if (now - (record.lastAccess || 0) > CONFIG.SECURITY.CLEANUP_INTERVAL_MS) {
+            loginAttempts.delete(ip);
         }
     }
-    if (cleaned > 0) console.log(`🧹 Cleaned ${cleaned} expired login attempts.`);
-}, CONFIG.SECURITY.CLEANUP_INTERVAL_MS);
+    // 仍然超限：丢弃最旧的一半，给内存兜底
+    if (loginAttempts.size >= MAX_TRACKED_IPS) {
+        const entries = [...loginAttempts.entries()].sort((a, b) => a[1].lastAccess - b[1].lastAccess);
+        for (let i = 0; i < entries.length / 2; i++) loginAttempts.delete(entries[i][0]);
+    }
+};
 
 const genToken = () => {
     const exp = Date.now() + CONFIG.SECURITY.TOKEN_EXPIRY_MS;
@@ -116,7 +126,9 @@ const checkToken = (t) => {
         const [u, e, jti, signature] = parts;
         const payloadToVerify = `${u}.${e}.${jti}`;
         const expectedSig = crypto.createHmac('sha256', CONFIG.JWT_SECRET).update(payloadToVerify).digest('hex');
-        if (!crypto.timingSafeEqual(Buffer.from(expectedSig), Buffer.from(signature))) return false;
+        // 必须先校验 64 位 hex，再按 hex 解码；否则 length 不等会抛异常走 catch，掩盖真实原因
+        if (!/^[0-9a-f]{64}$/.test(signature)) return false;
+        if (!crypto.timingSafeEqual(Buffer.from(expectedSig, 'hex'), Buffer.from(signature, 'hex'))) return false;
         const expiry = parseInt(e, 10);
         if (isNaN(expiry) || Date.now() > expiry) return false;
         if (u !== CONFIG.AUTH_USER) return false;
@@ -125,21 +137,28 @@ const checkToken = (t) => {
 };
 
 const isIpLocked = (ip) => {
-    const record = loginAttempts[ip];
+    const record = loginAttempts.get(ip);
     if (!record) return false;
     if (record.lockUntil === 0) return false;
-    if (Date.now() > record.lockUntil) { delete loginAttempts[ip]; return false; }
+    if (Date.now() > record.lockUntil) { loginAttempts.delete(ip); return false; }
     return true;
 };
 
 const recordLoginAttempt = (ip, success) => {
-    if (success) { delete loginAttempts[ip]; return; }
+    if (success) { loginAttempts.delete(ip); return; }
     const now = Date.now();
-    if (!loginAttempts[ip]) loginAttempts[ip] = { count: 1, lockUntil: 0, lastAccess: now };
-    else { if (now < loginAttempts[ip].lockUntil) return; loginAttempts[ip].count += 1; loginAttempts[ip].lastAccess = now; }
-    if (loginAttempts[ip].count >= CONFIG.SECURITY.MAX_LOGIN_ATTEMPTS) {
-        loginAttempts[ip].lockUntil = now + CONFIG.SECURITY.LOCK_DURATION_MS;
-        loginAttempts[ip].lastAccess = now;
+    const record = loginAttempts.get(ip);
+    if (!record) {
+        loginAttempts.set(ip, { count: 1, lockUntil: 0, lastAccess: now });
+    } else {
+        if (now < record.lockUntil) return;
+        record.count += 1;
+        record.lastAccess = now;
+    }
+    const after = loginAttempts.get(ip);
+    if (after.count >= CONFIG.SECURITY.MAX_LOGIN_ATTEMPTS) {
+        after.lockUntil = now + CONFIG.SECURITY.LOCK_DURATION_MS;
+        after.lastAccess = now;
         console.warn(`🔒 IP ${ip} locked.`);
     }
 };
@@ -177,40 +196,49 @@ exports.handler = async function (event, context) {
 
     // 推断 method — FC 3.0 HTTP 触发器把 method 放在 requestContext.http.method
     const rc = parsedEvent.requestContext || {};
-    const method = (rc.http && rc.http.method) || hdrs['x-http-method-override'] || parsedEvent.httpMethod || 'GET';
+    const method = (((rc.http && rc.http.method) || parsedEvent.httpMethod || hdrs['x-http-method-override'] || 'GET') + '').toUpperCase();
 
-    // 处理 body
-    let bodyBuf = parsedEvent.body || '';
-    if (parsedEvent.isBase64Encoded) {
-        try { bodyBuf = Buffer.from(bodyBuf, 'base64'); } catch(e) {}
-    } else {
-        bodyBuf = Buffer.from(String(bodyBuf));
-    }
-
-    // 🛡 兜底：大文件边界保护（防止伪造 Content-Length 绕过）
-    const maxUploadSize = CONFIG.SECURITY.MAX_FILE_SIZE;
-    if (bodyBuf.length > maxUploadSize) {
-        return { statusCode: 413, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ success: false, message: 'File too large' }), isBase64Encoded: false };
-    }
-
-    // CORS: 如果 FC 控制台已开启"允许跨域"，代码不重复设置
-    // 如果 FC 未开启 CORS，取消下面注释启用代码级 CORS
+    // 🛡 CORS：默认由 FC 控制台「允许跨域」处理，此处不重复设置。
+    // 若改用代码级 CORS，取消下面注释块即可 —— corsHeaders 已在下方声明，
+    // 注释块内只做**赋值**，不会与外层重复声明（重复 const 会 SyntaxError 导致函数起不来）。
+    let corsHeaders = {};
     /*
-    const origin = hdrs['origin'] || '';
-    if (!isValidOrigin(origin) && origin) {
+    const origin = String(hdrs['origin'] || '');
+    if (origin && !isValidOrigin(origin)) {
         return { statusCode: 403, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ success: false, message: 'Forbidden Origin' }), isBase64Encoded: false };
     }
-    const corsHeaders = {
+    corsHeaders = {
         'access-control-allow-origin': origin || '*',
         'access-control-allow-methods': 'POST, GET, OPTIONS',
         'access-control-allow-headers': 'Content-Type, Authorization',
         'access-control-allow-credentials': 'true'
     };
     */
-    const corsHeaders = {};
 
     if (method === 'OPTIONS') {
         return { statusCode: 204, headers: corsHeaders, body: '', isBase64Encoded: false };
+    }
+
+    // 🛡 body 惰性解码：先用未解码长度粗判，鉴权通过后才真正分配 Buffer。
+    // 一开始就 Buffer.from 会让未认证的大 body 先吃掉几十 MB（FC 规格仅 128 MB）。
+    const rawBody = parsedEvent.body || '';
+    const approxBytes = parsedEvent.isBase64Encoded
+        ? Math.floor(String(rawBody).length * 3 / 4)
+        : Buffer.byteLength(String(rawBody));
+
+    let _bodyBuf = null;
+    const decodeBody = () => {
+        if (_bodyBuf === null) {
+            _bodyBuf = parsedEvent.isBase64Encoded
+                ? Buffer.from(String(rawBody), 'base64')
+                : Buffer.from(String(rawBody));
+        }
+        return _bodyBuf;
+    };
+
+    // 🛡 全局兜底：未解码长度已超上限直接拒（防伪造 Content-Length 绕过，且不分配 Buffer）
+    if (approxBytes > CONFIG.SECURITY.MAX_FILE_SIZE) {
+        return { statusCode: 413, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ success: false, message: 'File too large' }), isBase64Encoded: false };
     }
 
     // 构造 res
@@ -223,6 +251,7 @@ exports.handler = async function (event, context) {
         responseHeaders = {
             ...corsHeaders,
             'content-type': 'application/json',
+            'cache-control': 'no-store',
             'x-content-type-options': 'nosniff',
             'strict-transport-security': 'max-age=31536000; includeSubDomains'
         };
@@ -240,12 +269,25 @@ exports.handler = async function (event, context) {
 
     // --- /login ---
     if (path === '/login') {
-        const ip = hdrs['x-forwarded-for']?.split(',')[0]?.trim() || '127.0.0.1';
-        if (isIpLocked(ip)) {
-            return { statusCode: 429, headers: { ...corsHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ success: false, message: 'Too many attempts.' }), isBase64Encoded: false };
+        if (method !== 'POST') {
+            sendJson(405, { success: false, message: 'Method Not Allowed' });
+            return { statusCode, headers: responseHeaders, body: responseBody, isBase64Encoded: false };
         }
+        // IP 优先取 FC 平台注入的 sourceIp；XFF 最左值可能被客户端伪造，不可直接信任
+        const xff = String(hdrs['x-forwarded-for'] || '').split(',')[0].trim();
+        const rawIp = (rc.http && rc.http.sourceIp) || hdrs['x-real-ip'] || xff || '127.0.0.1';
+        const ip = isValidIp(rawIp) ? rawIp : 'untrusted';
+        cleanupLoginAttempts(Date.now());
+        if (isIpLocked(ip)) {
+            return { statusCode: 429, headers: { ...corsHeaders, 'content-type': 'application/json', 'cache-control': 'no-store' }, body: JSON.stringify({ success: false, message: 'Too many attempts.' }), isBase64Encoded: false };
+        }
+        // 4KB 限制必须在 JSON.parse 之前，且用未解码长度先判（不为超大垃圾请求分配 Buffer）
+        if (approxBytes > CONFIG.SECURITY.MAX_LOGIN_BODY_SIZE) {
+            return { statusCode: 413, headers: { ...corsHeaders, 'content-type': 'application/json', 'cache-control': 'no-store' }, body: JSON.stringify({ success: false, message: 'Request too large' }), isBase64Encoded: false };
+        }
+        const bodyBuf = decodeBody();
         if (bodyBuf.length > CONFIG.SECURITY.MAX_LOGIN_BODY_SIZE) {
-            return { statusCode: 413, headers: { ...corsHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ success: false, message: 'Request too large' }), isBase64Encoded: false };
+            return { statusCode: 413, headers: { ...corsHeaders, 'content-type': 'application/json', 'cache-control': 'no-store' }, body: JSON.stringify({ success: false, message: 'Request too large' }), isBase64Encoded: false };
         }
         try {
             const { user, pass } = JSON.parse(bodyBuf.toString());
@@ -264,14 +306,19 @@ exports.handler = async function (event, context) {
 
     // --- /upload ---
     if (path === '/upload') {
+        if (method !== 'POST') {
+            sendJson(405, { success: false, message: 'Method Not Allowed' });
+            return { statusCode, headers: responseHeaders, body: responseBody, isBase64Encoded: false };
+        }
         const auth = hdrs['authorization'];
-        const token = auth && auth.startsWith('Bearer ') ? auth.slice(7) : null;
+        const token = auth && String(auth).startsWith('Bearer ') ? String(auth).slice(7) : null;
+        // 先鉴权，通过后才解码 body —— 未认证的大 body 不该分配 Buffer
         if (!checkToken(token)) {
             sendJson(401, { success: false, message: 'Unauthorized' });
             return { statusCode, headers: responseHeaders, body: responseBody, isBase64Encoded: false };
         }
 
-        const contentType = (hdrs['content-type'] || '').split(';')[0].trim();
+        const contentType = String(hdrs['content-type'] || '').split(';')[0].trim().toLowerCase();
         if (!ALLOWED_MIME_TYPES.has(contentType)) {
             sendJson(400, { success: false, message: 'File type not allowed.' });
             return { statusCode, headers: responseHeaders, body: responseBody, isBase64Encoded: false };
@@ -279,6 +326,12 @@ exports.handler = async function (event, context) {
 
         const cl = parseInt(hdrs['content-length'] || '0', 10);
         if (cl > CONFIG.SECURITY.MAX_FILE_SIZE) {
+            sendJson(413, { success: false, message: 'File too large' });
+            return { statusCode, headers: responseHeaders, body: responseBody, isBase64Encoded: false };
+        }
+
+        const bodyBuf = decodeBody();
+        if (bodyBuf.length > CONFIG.SECURITY.MAX_FILE_SIZE) {
             sendJson(413, { success: false, message: 'File too large' });
             return { statusCode, headers: responseHeaders, body: responseBody, isBase64Encoded: false };
         }

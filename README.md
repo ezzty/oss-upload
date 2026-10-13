@@ -59,7 +59,7 @@ Release 附件即开即用，**不需要本地装 Node.js**。想自己构建依
 | 变量名 | 示例值 | 说明 |
 | :--- | :--- | :--- |
 | `AUTH_USER` | `admin` | 登录用户名 |
-| `AUTH_PASS` | `Tu1111111` | 登录密码（建议 `openssl rand -base64 24`） |
+| `AUTH_PASS` | `<your-strong-password>` | 登录密码，**必须自己生成**：`openssl rand -base64 24` |
 | `JWT_SECRET` | `my-secret-key...` | Token 签名密钥（建议 `openssl rand -base64 32`） |
 | `OSS_ACCESS_KEY_ID` | `LTAI...` | 阿里云 AccessKey ID |
 | `OSS_ACCESS_KEY_SECRET` | `<your-accesskey-secret>` | 阿里云 AccessKey Secret |

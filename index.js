@@ -227,11 +227,15 @@ exports.handler = async function (event, context) {
         : Buffer.byteLength(String(rawBody));
 
     let _bodyBuf = null;
-    const decodeBody = () => {
+    // encoding 仅对「未 base64 编码」的分支生效：
+    //   - /login 传 utf8（JSON 文本，中文必须按 utf8 还原）
+    //   - /upload 传 binary（图片字节流，按 utf8 解码会损坏高位字节 → 魔数校验必失败）
+    //   - base64 分支与 encoding 无关，始终按 base64 解
+    const decodeBody = (encoding) => {
         if (_bodyBuf === null) {
             _bodyBuf = parsedEvent.isBase64Encoded
                 ? Buffer.from(String(rawBody), 'base64')
-                : Buffer.from(String(rawBody));
+                : Buffer.from(String(rawBody), encoding || 'utf8');
         }
         return _bodyBuf;
     };
@@ -330,7 +334,7 @@ exports.handler = async function (event, context) {
             return { statusCode, headers: responseHeaders, body: responseBody, isBase64Encoded: false };
         }
 
-        const bodyBuf = decodeBody();
+        const bodyBuf = decodeBody('binary');
         if (bodyBuf.length > CONFIG.SECURITY.MAX_FILE_SIZE) {
             sendJson(413, { success: false, message: 'File too large' });
             return { statusCode, headers: responseHeaders, body: responseBody, isBase64Encoded: false };

@@ -17,3 +17,11 @@ upload_to_oss.py
 
 # Logs
 *.log
+
+# Environment / credentials
+.env
+.env.local
+*.key
+*.pem
+*.p12
+credentials.json

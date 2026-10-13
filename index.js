@@ -144,7 +144,7 @@ const recordLoginAttempt = (ip, success) => {
     }
 };
 
-// 🛡 Origin 校验 — 优先使用环境变量，向后兼容硬编码 example.com
+// 🛡 Origin 校验 — 优先使用环境变量；未配置时用占位兜底，部署时务必设 ALLOWED_ORIGINS
 const ALLOWED_HOSTS = process.env.ALLOWED_ORIGINS
     ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean)
     : ['example.com'];

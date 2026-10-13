@@ -18,11 +18,23 @@
 
 ## 🛠️ 部署指南
 
-### 第一步：配置依赖层 (Layer)
+### 第一步：构建并配置依赖层 (Layer)
+> ⚠️ 仓库中**不含** `layer.zip`（它是构建产物，已被 `.gitignore` 忽略），需先在本地生成一次。
+
+```bash
+mkdir -p layer-build/nodejs
+cd layer-build
+npm init -y
+npm install ali-oss
+cd nodejs && zip -r ../layer.zip node_modules
+```
+
+产物 `layer.zip` 约 3MB，内部结构必须是 `nodejs/node_modules/`。
+
 *只需操作一次。*
 1. 进入 [阿里云函数计算控制台](https://fcnext.console.aliyun.com/)。
 2. 点击左侧 **层管理** -> **创建层**。
-3. 上传 `layer.zip`，运行时选择 **Node.js 18**。
+3. 上传刚生成的 `layer.zip`，运行时选择 **Node.js 18**。
 4. 记录层名称（例如：`oss-upload-dependencies`）。
 
 ### 第二步：部署函数与配置

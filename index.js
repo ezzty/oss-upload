@@ -291,9 +291,13 @@ exports.handler = async function (event, context) {
 
         const ext = EXT_MAP[mime] || '.bin';
         const randomName = crypto.randomBytes(3).toString('hex');
-        const d = new Date();
-        const dateStr = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`;
-        const key = `img/m/${dateStr}/${randomName}${ext}`;
+        // 路径格式：m/YY{月字母}DD/随机名 —— a=1月…l=12月（例：26j07 = 2026年10月7日）
+        // 用北京时间(+8)取日期，避免FC默认UTC导致凌晨上传落到前一天
+        const d = new Date(Date.now() + 8 * 3600 * 1000);
+        const yy = String(d.getUTCFullYear()).slice(2);
+        const mon = 'abcdefghijkl'[d.getUTCMonth()];
+        const dd = String(d.getUTCDate()).padStart(2, '0');
+        const key = `m/${yy}${mon}${dd}/${randomName}${ext}`;
 
         try {
             const stream = new PassThrough();

@@ -132,6 +132,26 @@ m/YY{月字母}DD/{6位十六进制}.{扩展名}
 
 - **按北京时间生成**（代码里 `+8小时` 后取 UTC 分量），否则 FC 默认 UTC，北京时间 0:00–7:59 的上传会落到前一天的目录
 - 文件名 `crypto.randomBytes(3)` = 6 位 hex，约 1677 万种组合，配合每日目录几乎不可能覆盖已有文件
+- **不需要** `img/` 之类的额外层级，每省一个目录 URL 短一截
+
+### OSS 图片处理（强烈推荐）
+
+OSS 自带图片处理，URL 后面加参数即可实时生成缩略图，**不占用额外存储**：
+
+```
+https://img.example.com/m/26j13/ab12cd.jpg?x-oss-process=style/w950
+```
+
+先在 OSS 控制台创建样式 `w950`（宽 950px、自动转 WebP、质量自适应）。
+
+**实测效果**（真实数据）：
+
+|  | 大小 |
+| --- | --- |
+| 原图 | 1.89 MB |
+| `?x-oss-process=style/w950` | **81 KB（省 96%）** |
+
+网页里引用大图是浪费带宽的头号原因——**正文永远用样式 URL，点击看原图**。
 
 ---
 
@@ -170,6 +190,169 @@ token 里的 `jti` 只是随机数，**没有服务端存储**，所以：
 
 ---
 
+## 🧩 核心实现（代码级）
+
+上一节是「有哪些防线」，这里是「怎么实现的」。
+
+### Token 结构（自实现，不引第三方 JWT 库）
+
+```
+token = username . 过期时间戳 . jti . HMAC-SHA256(username.exp.jti, JWT_SECRET)
+```
+
+四个安全点：
+
+1. `crypto.timingSafeEqual` **常数时间比较** —— 不用 `===`，避免通过响应耗时逐字节猜签名（时序攻击）
+2. `jti`（`randomBytes(8)`，16 位 hex）保证每次签发不同 —— ⚠️ 但它**不防重放**，见上一节
+3. **24 小时过期** —— 过期时间是签名的一部分，改不了
+4. **校验用户名** —— token 必须对得上当前配置的 `AUTH_USER`，换密码/换用户后旧 token 自动失效
+
+### MIME 白名单 + 魔数检测
+
+```javascript
+const ALLOWED_MIME_TYPES = new Set([
+    'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/bmp'
+]);
+```
+
+`Content-Type` 头由客户端说了算，所以还要读文件头字节判断真实类型：
+
+| 类型 | 魔数 |
+| --- | --- |
+| JPEG | `FF D8 FF` |
+| PNG | `89 50 4E 47 0D 0A 1A 0A` |
+| GIF | `47 49 46 38 39/61 61` |
+| WebP | `RIFF....WEBP`（RIFF + 偏移 8 处 WEBP） |
+| BMP | `42 4D` |
+
+两道都过才存。这样即使有人把 `.php` 重命名为 `.jpg` 上传，服务端也会因为魔数对不上而拒绝。
+
+### 体积校验：三道，一道比一道真
+
+```javascript
+// ① 全局兜底：未解码长度粗判（防伪造 Content-Length，且不分配 Buffer）
+if (approxBytes > CONFIG.SECURITY.MAX_FILE_SIZE) return 413;
+
+// ② 看客户端声明的 Content-Length 头
+const cl = parseInt(hdrs['content-length'] || '0', 10);
+if (cl > CONFIG.SECURITY.MAX_FILE_SIZE) return 413;
+
+// ③ 真实 body 长度（兜底）
+if (bodyBuf.length > CONFIG.SECURITY.MAX_FILE_SIZE) return 413;
+```
+
+只信 `Content-Length` 是危险的——它由客户端声明，可以伪造小数值绕过检查。**必须再量一次真实字节数**。
+
+### 登录体 4KB 上限
+
+```javascript
+if (bodyBuf.length > CONFIG.SECURITY.MAX_LOGIN_BODY_SIZE) {  // 4KB
+    return { statusCode: 413, ... };
+}
+```
+
+**这是个容易被忽略的防护**：`/login` 只需要 `{user, pass}` 两个字段，但如果没有体积上限，攻击者可以 POST 一个 10MB 的 body 让服务端做 `JSON.parse`，用极小的代价打满内存。4KB 足够装下正常登录请求，超了直接 413，**连 JSON 解析都不进**。
+
+> 这个检查必须放在 `JSON.parse` **之前**才有效。
+
+### IP 防爆破：为什么必须用 `Map`
+
+```javascript
+const loginAttempts = new Map();      // ⚠️ 用 Map，不要用普通对象 {}
+const isValidIp = (ip) =>
+    /^(?:\d{1,3}\.){3}\d{1,3}$/.test(ip) || /^[0-9a-fA-F:]{3,45}$/.test(ip);
+```
+
+防爆破表的键来自请求头。如果用 `{}` 而客户端送 `X-Forwarded-For: __proto__`，执行 `loginAttempts[ip].count += 1` 就会把 `count` 写进 `Object.prototype`，**污染进程里所有空对象**（实测 `{}.__proto__.count` 变成 `NaN`，且之后每个空对象都凭空多出 `count` 属性）。`Map` 天然免疫，再加 IP 格式校验把特殊键挡在门外。
+
+**IP 从哪拿**：优先 `requestContext.http.sourceIp`（FC 平台注入、客户端改不了），`X-Forwarded-For` 最左值是客户端可控的，只能当兜底。
+
+### 来源白名单（仅启用代码级 CORS 时生效）
+
+```javascript
+const ALLOWED_HOSTS = process.env.ALLOWED_ORIGINS
+    ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean)
+    : ['<你的域名>'];   // ⚠️ 代码里的兜底值，部署时务必用 ALLOWED_ORIGINS 覆盖
+
+const isValidOrigin = (origin) => {
+    const h = new URL(origin).hostname;
+    return ALLOWED_HOSTS.some(domain => h === domain || h.endsWith('.' + domain));
+};
+```
+
+- 支持**子域通配**：填 `example.com` 则 `www.example.com`、`blog.example.com` 都放行
+- 没有 Origin 头的请求放行（服务端脚本、curl 调试场景）
+
+### 安全响应头
+
+```javascript
+'x-content-type-options': 'nosniff',
+'strict-transport-security': 'max-age=31536000; includeSubDomains',
+'cache-control': 'no-store'          // 登录返回的 token 不许被中间层缓存
+```
+
+`nosniff` 阻止浏览器把 JSON 当脚本执行，HSTS 强制 HTTPS，`no-store` 防止 CDN/代理缓存住登录响应里的 token。
+
+### FC 事件格式兼容与 body 解码（含两个坑）
+
+```javascript
+const path = parsedEvent.rawPath || parsedEvent.path || parsedEvent.pathName || '/';
+const method = (((rc.http && rc.http.method) || parsedEvent.httpMethod
+                 || hdrs['x-http-method-override'] || 'GET') + '').toUpperCase();
+
+// 惰性解码：先用未解码长度粗判，鉴权通过后才真正分配 Buffer
+const rawBody = parsedEvent.body || '';
+const approxBytes = parsedEvent.isBase64Encoded
+    ? Math.floor(String(rawBody).length * 3 / 4)
+    : Buffer.byteLength(String(rawBody));
+
+let _bodyBuf = null;
+const decodeBody = (encoding) => {      // ← 编码必须显式指定，见下
+    if (_bodyBuf === null) {
+        _bodyBuf = parsedEvent.isBase64Encoded
+            ? Buffer.from(String(rawBody), 'base64')
+            : Buffer.from(String(rawBody), encoding || 'utf8');
+    }
+    return _bodyBuf;
+};
+
+// /login  → decodeBody()          JSON 文本，按 utf8 还原（中文密码也能正确解析）
+// /upload → decodeBody('binary')  图片字节流，见下面的坑
+```
+
+FC 不同版本的 HTTP 触发器事件结构不一样，而且**二进制 body 常常被 base64 编码**。不处理 `isBase64Encoded`，你会收到一坨 base64 文本然后魔数校验永远失败——这是新人最常见的翻车点。
+
+⚠️ **坑一：别一进 handler 就解码**。那意味着任何未认证的请求都能让你先分配几十 MB Buffer（FC 规格才 128 MB）。正确顺序是**先判路径 → 再鉴权 → 最后解码**，长度粗判用 `approxBytes` 就够（base64 解码后约 `len × 3/4`，无需真解）。
+
+⚠️ **坑二：未编码的二进制 body 不能按 UTF-8 解**。`Buffer.from(str)` 默认就是 `utf8`，图片字节流里的高位字节（比如 PNG 头的 `0x89`）不是合法 UTF-8，会被解码成替换字符 `�`，**字节就永久毁了**——于是魔数校验对一张正常图片也永远失败，报 `Invalid file content`。这与「没处理 `isBase64Encoded`」症状一模一样，但按那条思路查会走进死胡同。
+
+实测踩坑过程：桌面浏览器和安卓都传得好好的，**iOS 必失败**，服务端把收到的头打印出来才发现 `Content-Length: 0` / `rawLen=0`——根因其实在前端（iOS Safari 对 `xhr.send(File)` 会丢 body，见下节），但**顺带暴露了这个解码 bug**：只要客户端不走 base64 编码，`Buffer.from(str)` 这条路就必然毁字节。
+
+修法就是 `decodeBody('binary')`（`'binary'` 即 latin1，一个字符对应一个字节，不会损坏高位字节）。**只在图片那条路径用**；登录 body 是 JSON 文本，必须按 utf8 解，否则中文用户名/密码会乱码。
+
+### 前端发送：别直接 `xhr.send(File)`
+
+```javascript
+// ❌ 写起来最自然，但 iOS Safari 上服务端收到 0 字节
+xhr.send(currentFile);
+
+// ✅ 先读成 ArrayBuffer 再发
+const buf = await currentFile.arrayBuffer();
+xhr.setRequestHeader('Content-Type', currentFile.type || 'application/octet-stream');
+xhr.send(buf);
+```
+
+**诊断特征**：桌面和安卓都正常，**iOS 必失败**，大小图都一样；服务端打印收到的请求头，显示 `Content-Length: 0`、`rawLen=0`、`te=none`，而前端明明 `file.size = 5311352`。**body 是在浏览器发出去之前就没写**，不是网关截断、不是格式问题。
+
+两个配套细节：
+
+- **必须显式设 `Content-Type`**：`ArrayBuffer` 发出去默认是 `application/octet-stream`，会被 MIME 白名单拒掉
+- **别加自定义请求头**（比如 `X-Client-Size` 之类的调试头）：预检的 `Access-Control-Allow-Headers` 是固定值 `content-type, authorization`，多一个头浏览器会直接把请求拦下，症状变成「完全发不出去」
+
+> 排查这类问题别靠猜：在前端把 `file.size`、在服务端把 `rawLen`/`content-length` **两边都打印出来对比**，一行数据就能定案。
+
+---
+
 ## 🔧 构建依赖层
 
 不想用 Release 附件、或想升级依赖版本时，本地构建：
@@ -202,6 +385,28 @@ curl -s -o /dev/null -w "%{http_code}\n" -X POST https://api.your-domain.com/log
 
 返回 `413` = 新代码生效；返回 `200`/`401` = **线上跑的是旧代码**，重新检查部署包。
 
+> 用 python 探针的等价写法（适合放进 CI）：
+> ```bash
+> python3 -c "
+> import urllib.request, json
+> body = json.dumps({'password': 'x' * 10000}).encode()   # 10KB 登录体
+> req = urllib.request.Request('https://api.your-domain.com/login',
+>       data=body, method='POST', headers={'Content-Type': 'application/json'})
+> try:
+>     urllib.request.urlopen(req, timeout=20)
+> except Exception as e:
+>     print('HTTP', getattr(e, 'code', '?'))
+> "
+> ```
+
+**1.5 顺带验方法限制** —— 新版 `/login` `/upload` 只收 POST，其余返回 405：
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" https://api.your-domain.com/login
+```
+
+期望 `405`；返回 `400`/`401` 说明线上还是旧版代码。**这一招是本项目最有价值的运维技巧：代码改动有没有真正上线，一个探针就能验出来**，不靠「我明明传了啊」。
+
 **2. 鉴权探针** —— 错误 token 传 `/upload`，期望 `401`：
 
 ```bash
@@ -212,6 +417,13 @@ curl -s -o /dev/null -w "%{http_code}\n" -X POST https://api.your-domain.com/upl
 **3. 真实上传** —— 页面上传一张图，确认返回 markdown 且 URL 可访问。
 
 **4. 回 OSS 核实对象真的存在** —— 这一步不能省。CDN 有缓存，一张**已经从 OSS 删掉的图片**，CDN 节点可能继续返回 200 很长时间。只 curl CDN 会得到"一切正常"的假象。
+
+```python
+import oss2
+auth = oss2.Auth('<AK>', '<SK>')
+b = oss2.Bucket(auth, 'https://oss-cn-hangzhou.aliyuncs.com', 'my-img')
+print('存在:', b.object_exists('m/26j13/ab12cd.jpg'))
+```
 
 上传验证 = **CDN 200 + OSS 里对象确实存在**，两个都对才算数。
 

@@ -80,9 +80,23 @@ Release 附件即开即用，**不需要本地装 Node.js**。想自己构建依
 - 创建 HTTP 触发器，鉴权方式选「免鉴权」（鉴权由代码自己做）
 - 域名管理 → 绑定自定义域名 + HTTPS 证书
 
-⚠️ **CORS 只能选一种**：要么在触发器设置里开「允许跨域」（默认推荐），要么取消 `index.js` 第 **205–215** 行的注释启用代码级 CORS。**两个都开会导致响应头重复**，浏览器报 CORS 错误。
+#### HTTP 触发器与 CORS
+
+三种方式二选一，**默认就是「平台回显」**——网关直接把请求的 `Origin` 回显成 `Access-Control-Allow-Origin`，不校验来源：
+
+| 方式 | 白名单 | 改代码 | 备注 |
+| --- | --- | --- | --- |
+| **API Configured CORS** | ✅ `allowOrigins` 数组 | 否 | **邀测**能力，需联系阿里云开通，走 API 配置，预检不计费 |
+| **默认 CORS**（推荐，本项目默认） | ❌ 无，直接回显 | 否 | 平台默认行为 |
+| **代码级 CORS** | ✅ 自己写判断 | 是（`index.js` 的 CORS 块） | 预检会调用函数并计费 |
+
+⚠️ **FC 控制台里没有「勾选允许跨域 / 填白名单域名」这样的选项**——已核对官方文档，白名单只能通过 API Configured CORS 的 `allowOrigins` 或代码级 CORS 配置，**别照着某些教程去控制台里找这个开关**。
+
+⚠️ **不要同时开默认回显和代码级 CORS**：函数返回的头会与平台回显合并，可能产生重复的 `Access-Control-Allow-Origin`，浏览器会直接报错。要么取消 `index.js` 里代码级 CORS 的注释、要么不动，**二选一**。
 
 > 启用代码级 CORS 后**必须**设置 `ALLOWED_ORIGINS`，否则兜底值 `example.com` 会拦掉所有浏览器请求。
+
+**个人图床的建议**：先用默认 CORS 就够。它确实放行任意 `Origin`，但那只是「浏览器放不放行」，真正的门是 token 鉴权——没 token 照样 `401`。要收紧就申请开通 API Configured CORS，配 `allowOrigins: ["https://your-site.com"]`（⚠️ 它**不支持子域通配**，要逐个枚举）。
 
 ---
 
@@ -464,6 +478,12 @@ print('存在:', b.object_exists('m/26j13/ab12cd.jpg'))
 | 上传 413 `File too large` | 超过 20 MB | 前端也应拦一道 |
 | 上传 429 `Too many attempts` | 该 IP 登录失败满 5 次，锁 15 分钟 | 等待或重启函数 |
 | 魔数校验永远失败 | body 被 base64 编码但没解 | 检查 `isBase64Encoded` 分支 |
+| 魔数校验永远失败，但图片**没走 base64** | 未编码 body 按 UTF-8 解码，高位字节被毁 | `/upload` 用 `decodeBody('binary')`，见「核心实现」 |
+| 只有 iOS 上传失败，安卓/桌面正常；服务端 `rawLen=0` | iOS Safari 对 `xhr.send(File)` 丢 body | 先 `await file.arrayBuffer()` 再发，见「前端发送」 |
+| 凌晨上传的图落到前一天目录 | FC 用 UTC 取日期 | 用 `+8小时` 偏移 |
+| 自定义域名下看不到 `nosniff`/HSTS 头 | 平台层剥掉了 | 平台行为，不是 bug |
+| 本地代码改了，线上行为没变 | 部署包不是最新的 | 跑「上线验收」探针确认 |
+| `GET /login` 返回 400/401 而不是 405 | 线上是旧版代码（新版只收 POST） | 重新上传部署包 |
 | 登录/上传返回 405 | 用了 GET 等非 POST 方法 | 按 API 表用 POST |
 | 浏览器 CORS 报错 | 控制台 CORS 和代码 CORS 同时开 | 二选一 |
 | 浏览器 CORS 报错（启用了代码级 CORS） | `ALLOWED_ORIGINS` 没设或没更新 | 设为你的前端域名 |

@@ -32,7 +32,17 @@ const CONFIG = {
         MAX_LOGIN_BODY_SIZE: 4 * 1024,
         MAX_LOGIN_ATTEMPTS: 5,
         LOCK_DURATION_MS: 15 * 60 * 1000,
-        CLEANUP_INTERVAL_MS: 60 * 60 * 1000
+        CLEANUP_INTERVAL_MS: 60 * 60 * 1000,
+        // 🆕 指数退避
+        BACKOFF_BASE_MS: 500,
+        BACKOFF_EXP: 3,
+        BACKOFF_CAP_MS: 120000,
+        // 🆕 账号级全局锁定
+        GLOBAL_MAX_FAILURES: 20,
+        GLOBAL_LOCK_MS: 15 * 60 * 1000,
+        // 🆕 PoW 工作量证明
+        POW_DIFFICULTY: 4,
+        POW_TTL_MS: 5 * 60 * 1000
     }
 };
 
@@ -163,6 +173,52 @@ const recordLoginAttempt = (ip, success) => {
     }
 };
 
+// ──────────── 🆕 账号级全局锁定（堵 IP 轮换）────────────
+const globalAttempts = { count: 0, lockUntil: 0 };
+const isGlobalLocked = () => Date.now() < globalAttempts.lockUntil;
+const recordGlobalFailure = () => {
+    globalAttempts.count += 1;
+    if (globalAttempts.count >= CONFIG.SECURITY.GLOBAL_MAX_FAILURES) {
+        globalAttempts.lockUntil = Date.now() + CONFIG.SECURITY.GLOBAL_LOCK_MS;
+        console.warn(`🌐 Global lock: ${globalAttempts.count} failures.`);
+    }
+};
+const resetGlobalOnSuccess = () => {
+    globalAttempts.count = 0;
+    globalAttempts.lockUntil = 0;
+};
+
+// ──────────── 🆕 指数退避（base 3，封顶 2 分钟）────────────
+const getBackoffDelay = (failCount) =>
+    Math.min(
+        CONFIG.SECURITY.BACKOFF_BASE_MS * (CONFIG.SECURITY.BACKOFF_EXP ** failCount),
+        CONFIG.SECURITY.BACKOFF_CAP_MS
+    );
+
+// ──────────── 🆕 PoW 工作量证明 ────────────
+const powChallenges = new Map();
+const issueChallenge = () => {
+    const c = crypto.randomBytes(16).toString('hex');
+    const now = Date.now();
+    powChallenges.set(c, now);
+    // 惰性清理过期 challenge（FC 无可靠 setInterval，同 cleanupLoginAttempts 思路）
+    if (powChallenges.size > 200) {
+        for (const [k, ts] of powChallenges) {
+            if (now - ts > CONFIG.SECURITY.POW_TTL_MS) powChallenges.delete(k);
+        }
+    }
+    return c;
+};
+const verifyPoW = (challenge, nonce) => {
+    if (typeof challenge !== 'string' || !Number.isFinite(nonce)) return false;
+    const ts = powChallenges.get(challenge);
+    if (!ts) return false;
+    powChallenges.delete(challenge);            // 一次性，防重放
+    if (Date.now() - ts > CONFIG.SECURITY.POW_TTL_MS) return false;
+    const h = crypto.createHash('sha256').update(challenge + String(nonce)).digest('hex');
+    return h.startsWith('0'.repeat(CONFIG.SECURITY.POW_DIFFICULTY));
+};
+
 // 🛡 Origin 校验 — 优先使用环境变量；未配置时用占位兜底，部署时务必设 ALLOWED_ORIGINS
 const ALLOWED_HOSTS = process.env.ALLOWED_ORIGINS
     ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean)
@@ -285,6 +341,10 @@ exports.handler = async function (event, context) {
         if (isIpLocked(ip)) {
             return { statusCode: 429, headers: { ...corsHeaders, 'content-type': 'application/json', 'cache-control': 'no-store' }, body: JSON.stringify({ success: false, message: 'Too many attempts.' }), isBase64Encoded: false };
         }
+        // 🔒 PATCH A: 全局锁定（IP 轮换兜底）
+        if (isGlobalLocked()) {
+            return { statusCode: 429, headers: { ...corsHeaders, 'content-type': 'application/json', 'cache-control': 'no-store' }, body: JSON.stringify({ success: false, message: 'Service temporarily locked.' }), isBase64Encoded: false };
+        }
         // 4KB 限制必须在 JSON.parse 之前，且用未解码长度先判（不为超大垃圾请求分配 Buffer）
         if (approxBytes > CONFIG.SECURITY.MAX_LOGIN_BODY_SIZE) {
             return { statusCode: 413, headers: { ...corsHeaders, 'content-type': 'application/json', 'cache-control': 'no-store' }, body: JSON.stringify({ success: false, message: 'Request too large' }), isBase64Encoded: false };
@@ -294,13 +354,35 @@ exports.handler = async function (event, context) {
             return { statusCode: 413, headers: { ...corsHeaders, 'content-type': 'application/json', 'cache-control': 'no-store' }, body: JSON.stringify({ success: false, message: 'Request too large' }), isBase64Encoded: false };
         }
         try {
-            const { user, pass } = JSON.parse(bodyBuf.toString());
+            const { user, pass, challenge, nonce } = JSON.parse(bodyBuf.toString());
+
+            // 🔒 PATCH B: 该 IP 之前失败过 → 必须带 PoW（首次登录无感）
+            const needsPoW = loginAttempts.has(ip);
+            if (needsPoW && !verifyPoW(challenge, nonce)) {
+                sendJson(401, {
+                    success: false,
+                    message: 'PoW required',
+                    challenge: issueChallenge(),
+                    difficulty: CONFIG.SECURITY.POW_DIFFICULTY
+                });
+                return { statusCode, headers: responseHeaders, body: responseBody, isBase64Encoded: false };
+            }
             if (user === CONFIG.AUTH_USER && pass === CONFIG.AUTH_PASS) {
                 recordLoginAttempt(ip, true);
+                resetGlobalOnSuccess();   // 🔒 PATCH D: 成功登录重置全局计数
                 sendJson(200, { success: true, token: genToken() });
             } else {
                 recordLoginAttempt(ip, false);
-                sendJson(401, { success: false, message: 'Invalid credentials' });
+                // 🔒 PATCH C: 全局计数 + 指数退避 + 返回新 challenge
+                recordGlobalFailure();
+                const failCount = loginAttempts.get(ip)?.count || 1;
+                await new Promise((r) => setTimeout(r, getBackoffDelay(failCount)));
+                sendJson(401, {
+                    success: false,
+                    message: 'Invalid credentials',
+                    challenge: issueChallenge(),
+                    difficulty: CONFIG.SECURITY.POW_DIFFICULTY
+                });
             }
         } catch(e) {
             sendJson(400, { success: false, message: 'Invalid JSON' });

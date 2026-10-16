@@ -327,6 +327,20 @@ exports.handler = async function (event, context) {
         return { statusCode, headers: responseHeaders, body: responseBody, isBase64Encoded: false };
     }
 
+    // --- /challenge (🆕 PoW 发题) ---
+    if (path === '/challenge') {
+        if (method !== 'GET') {
+            sendJson(405, { success: false, message: 'Method Not Allowed' });
+            return { statusCode, headers: responseHeaders, body: responseBody, isBase64Encoded: false };
+        }
+        sendJson(200, {
+            success: true,
+            challenge: issueChallenge(),
+            difficulty: CONFIG.SECURITY.POW_DIFFICULTY
+        });
+        return { statusCode, headers: responseHeaders, body: responseBody, isBase64Encoded: false };
+    }
+
     // --- /login ---
     if (path === '/login') {
         if (method !== 'POST') {
@@ -356,9 +370,8 @@ exports.handler = async function (event, context) {
         try {
             const { user, pass, challenge, nonce } = JSON.parse(bodyBuf.toString());
 
-            // 🔒 PATCH B: 该 IP 之前失败过 → 必须带 PoW（首次登录无感）
-            const needsPoW = loginAttempts.has(ip);
-            if (needsPoW && !verifyPoW(challenge, nonce)) {
+            // 🔒 PATCH B: 强制 PoW（FC 多实例不共享内存，needsPoW 判断不可靠，改为一律要求）
+            if (!verifyPoW(challenge, nonce)) {
                 sendJson(401, {
                     success: false,
                     message: 'PoW required',

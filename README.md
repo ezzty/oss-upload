@@ -60,7 +60,7 @@ Release 附件即开即用，**不需要本地装 Node.js**。想自己构建依
 | :--- | :--- | :--- |
 | `AUTH_USER` | `admin` | 登录用户名 |
 | `AUTH_PASS` | `<your-strong-password>` | 登录密码，**必须自己生成**：`openssl rand -base64 24` |
-| `JWT_SECRET` | `my-secret-key...` | Token 签名密钥（建议 `openssl rand -base64 32`） |
+| `JWT_SECRET` | `openssl rand -base64 32` | **签名密钥，32 字节 base64（256 bit）**。⚠️ **唯一能绕过全部防御的密钥**——泄露=攻击者可自己签发 token。必须用 `openssl rand -base64 32` 生成，< 32 字符等于裸奔 |
 | `OSS_ACCESS_KEY_ID` | `LTAI...` | 阿里云 AccessKey ID |
 | `OSS_ACCESS_KEY_SECRET` | `<your-accesskey-secret>` | 阿里云 AccessKey Secret |
 | `OSS_BUCKET` | `ioss` | 目标 Bucket 名称 |
@@ -104,8 +104,9 @@ Release 附件即开即用，**不需要本地装 Node.js**。想自己构建依
 
 | 方法 | 路径 | 说明 |
 | :--- | :--- | :--- |
-| POST | `/login` | 传 `{user, pass}`，返回 `{success, token}`（有效期 24h） |
-| POST | `/upload` | 需 `Authorization: Bearer <token>`，body 为图片二进制 + `Content-Type: image/*` |
+| GET | `/challenge` | 🆕 **发 PoW 题**，返回 `{challenge, difficulty}`。登录前必须先拿到 |
+| POST | `/login` | 传 `{user, pass, challenge, nonce}`，返回 `{success, token}`（有效期 **2h**）。⚠️ **必须带 PoW 答案**，不带直接返回 `PoW required` + 新 challenge |
+| POST | `/upload` | 需 Authorization Bearer token，body 为图片二进制 + `Content-Type: image/*`。🆕 **配额 299 次/天/token**，超限 429 |
 | GET | `/verify` | 传 Bearer token，返回 `{success: true/false}`，用于刷新页面后校验 token |
 
 上传成功返回：
@@ -129,6 +130,37 @@ const _FC_PARTS = ['https://', 'api.your-domain.com'];
 ```
 
 注意：前端的体积校验要和服务端的 20 MB 对齐，**以小的为准**。
+
+🆕 **登录必须走 PoW 流程**（否则服务端返回 `PoW required`）：
+
+```javascript
+// 1. 页面加载时拿 challenge
+const { challenge, difficulty } = await (await fetch(`${FC_URL}/challenge`)).json();
+
+// 2. 算 PoW（浏览器 Web Crypto）
+async function solvePoW(challenge, difficulty = 4) {
+  const target = '0'.repeat(difficulty);
+  const enc = new TextEncoder();
+  let nonce = 0;
+  while (true) {
+    const hash = await crypto.subtle.digest('SHA-256', enc.encode(challenge + nonce));
+    const hex = [...new Uint8Array(hash)].map(b => b.toString(16).padStart(2, '0')).join('');
+    if (hex.startsWith(target)) return nonce;
+    nonce++;
+  }
+}
+const nonce = await solvePoW(challenge, difficulty);
+
+// 3. 带 PoW 登录
+await fetch(`${FC_URL}/login`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ user, pass, challenge, nonce })
+});
+// 密码错时服务端会返回新 challenge，前端要记住它下次带
+```
+
+> **算题耗时**：difficulty=4 时浏览器约 100-400ms。正常用户一次登录只算 1 道题，**无感**；攻击方每次尝试都要算，爆破速度被物理性拖慢 300 倍。
 
 ---
 
@@ -176,7 +208,7 @@ https://img.example.com/m/26j13/ab12cd.jpg?x-oss-process=style/w950
 | **配置强校验** | 8 个环境变量缺一即 `exit(1)`，宁可启动失败也不带残缺配置对外服务 |
 | **登录体体积限制** | `/login` body 超 4 KB 直接 413，**在 `JSON.parse` 之前**，且用未解码长度先判（不为垃圾请求分配 Buffer） |
 | **Token 防伪** | HMAC-SHA256 签名，`crypto.timingSafeEqual` 常数时间比较（防时序攻击）；签名先校验 64 位 hex 再按 hex 解码 |
-| **Token 有效期** | 内含过期时间且过期时间在签名内，**改不了**；24h 后失效。⚠️ **不防重放**——token 在有效期内可重复使用，见下方说明 |
+| **Token 有效期** | 内含过期时间且过期时间在签名内，**改不了**；**2 小时**后失效（缩短被盗窗口）。⚠️ **不防重放**——token 在有效期内可重复使用，见下方说明 |
 | **IP 防爆破** | 登录失败 5 次锁 15 分钟，`Map` 计数，上限 1000 条 + 惰性清理 |
 | **IP 可信来源** | 优先取 FC 平台注入的 `requestContext.http.sourceIp`，不信任客户端可伪造的 `X-Forwarded-For` 最左值 |
 | **原型污染免疫** | 防爆破表用 `Map` + IP 格式校验，`X-Forwarded-For: __proto__` 之类特殊键直接失效 |
@@ -185,22 +217,35 @@ https://img.example.com/m/26j13/ab12cd.jpg?x-oss-process=style/w950
 | **方法限制** | `/login` `/upload` 仅接受 POST，其余返回 405 |
 | **惰性解码** | 鉴权通过后才把 body 解成 Buffer，未认证的大 body 不占用内存（适配 128 MB 小规格） |
 | **来源白名单** | `ALLOWED_ORIGINS` 支持子域通配，**仅在启用代码级 CORS 时生效**；默认由 FC 控制台 CORS 负责 |
+| 🆕 **强制 PoW** | 每次登录必须算 sha256 前 4 位 hex 0（≈6.5 万次 hash，浏览器 100-400ms）。**不看历史记录**（FC 多实例内存不共享，所以不依赖 `loginAttempts` 判断） |
+| 🆕 **指数退避** | 登录失败 `500ms × 3^t`，封顶 2 分钟。**服务端 sleep**——攻击方算 PoW 多快都没用，硬延迟 |
+| 🆕 **全局锁定** | 全站累计 20 次登录失败 → 全站锁 15 分钟（IP 轮换兜底） |
+| 🆕 **PoW 防重放** | challenge 一次性，`powChallenges.delete()` 用过即废；5 分钟过期 |
+| 🆕 **上传配额** | per-token 每日 **299 次**（按 jti 计），超限 429。防 token 被盗后滥用/塞满 OSS |
 | **安全响应头** | `X-Content-Type-Options: nosniff` + HSTS + `Cache-Control: no-store`（token 响应不被中间层缓存） |
 
-### ⚠️ 关于「防重放」
+### ⚠️ 关于「防重放」—— 分清两种
 
-token 里的 `jti` 只是随机数，**没有服务端存储**，所以：
-
+**1. Token 不防重放**（登录后）
+token 里的 `jti` 只是随机数，**没有服务端存储**：
 - ✅ 防篡改（改一个字符签名就失效）
-- ✅ 防过期（过期时间在签名里）
-- ❌ **不防重放**：同一个 token 在 24 小时内可以反复使用
+- ✅ 防过期（过期时间在签名里，**2 小时**）
+- ❌ **不防重放**：同一个 token 在 2 小时内可以反复使用
 
-要真正防重放需要外部存储（Redis / Tablestore）做 jti 黑名单或一次性校验，这会引入额外依赖，对个人图床不划算。**如果 token 泄露，立刻改 `JWT_SECRET` 并重启函数**，所有已发 token 立即作废。
+要真正防重放需要外部存储（Redis / Tablestore）做 jti 黑名单，这会引入额外依赖，对个人图床不划算。**如果 token 泄露，立刻改 `JWT_SECRET` 并重启函数**，所有已发 token 立即作废。
+
+**2. PoW challenge 防重放**（登录时）✅
+登录流程的 PoW challenge **是一次性的**：
+- `powChallenges.delete(challenge)` 验证后立即删除
+- 5 分钟过期
+- 同一个 `challenge+nonce` 二次使用 → `PoW required`
+
+所以**登录爆破**这条路是防重放的；只有**登录后**的 token 是不防重放的。
 
 ### ⚠️ 两个已知的平台行为
 
 1. **通过 FC 自定义域名访问时，`nosniff` / HSTS 响应头可能被平台层剥掉**，用 `curl -I` 看不到。这不是代码 bug。
-2. **IP 锁定是单实例内存级的** —— FC 多实例间不共享。它挡的是同一连接上的暴力尝试，不是分布式撞库。要防分布式需接 WAF 或验证码。
+2. **IP 锁定和全局锁定是单实例内存级的** —— FC 多实例间不共享，会被稀释。**但强制 PoW 不依赖内存状态**（每次请求都要算题），所以分布式撞库依然被拖慢 300 倍。PoW + 指数退避（服务端 sleep）共同弥补了多实例的稀释问题。
 
 ---
 
@@ -280,6 +325,60 @@ const isValidIp = (ip) =>
 防爆破表的键来自请求头。如果用 `{}` 而客户端送 `X-Forwarded-For: __proto__`，执行 `loginAttempts[ip].count += 1` 就会把 `count` 写进 `Object.prototype`，**污染进程里所有空对象**（实测 `{}.__proto__.count` 变成 `NaN`，且之后每个空对象都凭空多出 `count` 属性）。`Map` 天然免疫，再加 IP 格式校验把特殊键挡在门外。
 
 **IP 从哪拿**：优先 `requestContext.http.sourceIp`（FC 平台注入、客户端改不了），`X-Forwarded-For` 最左值是客户端可控的，只能当兜底。
+
+
+### 🆕 强制 PoW：让每次尝试都昂贵
+
+登录必须带 `challenge + nonce`，服务端算 1 次 sha256 验证：
+
+```js
+const verifyPoW = (challenge, nonce) => {
+    const ts = powChallenges.get(challenge);
+    if (!ts) return false;
+    powChallenges.delete(challenge);            // 一次性，防重放
+    const h = crypto.createHash('sha256').update(challenge + String(nonce)).digest('hex');
+    return h.startsWith('0'.repeat(4));         // 4 位 hex 0 ≈ 6.5 万次 hash
+};
+```
+
+**为什么"强制"而不是"失败后才要求"**：FC 多实例内存不共享，`loginAttempts.has(ip)` 判断不可靠（可能刚好路由到没记录的实例）。所以**不看历史**，一律要求 PoW —— 攻击方换 IP、换实例、GPU 加速都无效（每次都要算）。
+
+**为什么 GPU 加速没用**：攻击方可以用 ASIC 把 sha256 算快 10^6 倍，但**指数退避是服务端 sleep**（见下）——你算多快我都要等 2 分钟。
+
+### 🆕 指数退避：服务端硬延迟
+
+```js
+const getBackoffDelay = (failCount) =>
+    Math.min(500 * 3 ** failCount, 120000);   // 500ms 起，3 倍增长，封顶 2 分钟
+
+// 失败分支
+await new Promise((r) => setTimeout(r, getBackoffDelay(failCount)));
+```
+
+**关键**：`await sleep` 在**服务端**执行，攻击方的算力再强也没用。第 5 次失败后强制等 2 分钟（FC 实例空转，成本 0.0008 元）。
+
+**为什么 base 3 而不是 base 2**：增长更狠（第 5 次就到顶），配合 `CAP_MS: 120000` 封顶防止把自己人锁死（不封顶 3^8 = 1.8 小时）。
+
+### 🆕 上传配额：防滥用/塞满 OSS
+
+```js
+const checkUploadQuota = (jti) => {
+    const today = new Date().toISOString().slice(0, 10);
+    const rec = uploadQuota.get(jti);
+    if (!rec || rec.date !== today) {
+        uploadQuota.set(jti, { count: 1, date: today });
+        return true;
+    }
+    return rec.count < 299;   // per-token 每日 299 次
+};
+```
+
+**为什么按 jti 而不是 IP**：token 是按设备签发的（jti 唯一），按 jti 计数更精确；换 IP 不影响配额。
+
+**为什么 299 次/天**：299 × 20MB = 6GB/天 ≈ 0.72 元/天 ≈ 22 元/月封顶。即使 token 被盗滥用，成本可控。
+
+**已知局限**：FC 多实例内存不共享，配额计数会被稀释（N 实例 ÷ N）。**配合 OSS 生命周期规则**（自动清理旧对象）+ 账单告警更稳。
+
 
 ### 来源白名单（仅启用代码级 CORS 时生效）
 
@@ -420,6 +519,24 @@ curl -s -o /dev/null -w "%{http_code}\n" https://api.your-domain.com/login
 ```
 
 期望 `405`；返回 `400`/`401` 说明线上还是旧版代码。**这一招是本项目最有价值的运维技巧：代码改动有没有真正上线，一个探针就能验出来**，不靠「我明明传了啊」。
+
+**1.8 🆕 PoW 流程探针** —— 不带 challenge 登录，期望 `PoW required`：
+
+```bash
+curl -s -X POST https://api.your-domain.com/login \
+  -H "Content-Type: application/json" \
+  -d '{"user":"test","pass":"wrong"}'
+# 期望: {"success":false,"message":"PoW required","challenge":"...","difficulty":4}
+```
+
+返回 `Invalid credentials`（而非 `PoW required`）= **线上是旧代码**（强制 PoW 未生效）。
+
+**1.9 🆕 /challenge 端点探针**：
+
+```bash
+curl -s https://api.your-domain.com/challenge
+# 期望: {"success":true,"challenge":"<32 hex>","difficulty":4}
+```
 
 **2. 鉴权探针** —— 错误 token 传 `/upload`，期望 `401`：
 

@@ -27,7 +27,7 @@ const CONFIG = {
     },
     CDN_DOMAIN: process.env.CDN_DOMAIN,
     SECURITY: {
-        TOKEN_EXPIRY_MS: 24 * 60 * 60 * 1000,
+        TOKEN_EXPIRY_MS: 2 * 60 * 60 * 1000,   // 2 小时（缩短被盗窗口）
         MAX_FILE_SIZE: 20 * 1024 * 1024,
         MAX_LOGIN_BODY_SIZE: 4 * 1024,
         MAX_LOGIN_ATTEMPTS: 5,
@@ -42,7 +42,9 @@ const CONFIG = {
         GLOBAL_LOCK_MS: 15 * 60 * 1000,
         // 🆕 PoW 工作量证明
         POW_DIFFICULTY: 4,
-        POW_TTL_MS: 5 * 60 * 1000
+        POW_TTL_MS: 5 * 60 * 1000,
+        // 🆕 上传配额（per-token 每日限额）
+        UPLOAD_DAILY_LIMIT: 299
     }
 };
 
@@ -217,6 +219,27 @@ const verifyPoW = (challenge, nonce) => {
     if (Date.now() - ts > CONFIG.SECURITY.POW_TTL_MS) return false;
     const h = crypto.createHash('sha256').update(challenge + String(nonce)).digest('hex');
     return h.startsWith('0'.repeat(CONFIG.SECURITY.POW_DIFFICULTY));
+};
+
+// ──────────── 🆕 上传配额（per-token 每日限额，防滥用/塞满 OSS）────────────
+const uploadQuota = new Map();          // jti → { count, date }
+const checkUploadQuota = (jti) => {
+    if (typeof jti !== 'string' || !/^[0-9a-f]{16}$/.test(jti)) return false;
+    const today = new Date().toISOString().slice(0, 10);
+    const rec = uploadQuota.get(jti);
+    if (!rec || rec.date !== today) {
+        uploadQuota.set(jti, { count: 1, date: today });
+        // 惰性清理过期条目（FC 无可靠 setInterval）
+        if (uploadQuota.size > 1000) {
+            for (const [k, v] of uploadQuota) {
+                if (v.date !== today) uploadQuota.delete(k);
+            }
+        }
+        return true;
+    }
+    if (rec.count >= CONFIG.SECURITY.UPLOAD_DAILY_LIMIT) return false;
+    rec.count += 1;
+    return true;
 };
 
 // 🛡 Origin 校验 — 优先使用环境变量；未配置时用占位兜底，部署时务必设 ALLOWED_ORIGINS
@@ -414,6 +437,13 @@ exports.handler = async function (event, context) {
         // 先鉴权，通过后才解码 body —— 未认证的大 body 不该分配 Buffer
         if (!checkToken(token)) {
             sendJson(401, { success: false, message: 'Unauthorized' });
+            return { statusCode, headers: responseHeaders, body: responseBody, isBase64Encoded: false };
+        }
+
+        // 🔒 PATCH E: 上传配额（per-token 每日限额，防滥用/塞满 OSS）
+        const tokenJti = String(token).split('.')[2];
+        if (!checkUploadQuota(tokenJti)) {
+            sendJson(429, { success: false, message: 'Upload quota exceeded. Try again tomorrow.' });
             return { statusCode, headers: responseHeaders, body: responseBody, isBase64Encoded: false };
         }
 
